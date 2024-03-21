@@ -2,6 +2,7 @@
 #ifndef __EROFS_WORKQUEUE_H
 #define __EROFS_WORKQUEUE_H
 
+#include <pthread.h>
 #include "internal.h"
 
 struct erofs_workqueue;
