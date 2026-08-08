@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0+ OR Apache-2.0
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
 #include <unistd.h>
 #include <stdlib.h>
 #include <string.h>
@@ -11,6 +11,9 @@
 #include "erofs/xattr.h"
 #include "erofs/blobchunk.h"
 #include "erofs/importer.h"
+#if defined(HAVE_SYS_SYSMACROS_H)
+#include <sys/sysmacros.h>
+#endif
 #if defined(HAVE_ZLIB)
 #include <zlib.h>
 #endif
@@ -18,6 +21,7 @@
 #include "liberofs_cache.h"
 #include "liberofs_gzran.h"
 #include "liberofs_rebuild.h"
+#include "liberofs_sha256.h"
 
 /* This file is a tape/volume header.  Ignore it on extraction.  */
 #define GNUTYPE_VOLHDR 'V'
@@ -170,16 +174,17 @@ int erofs_iostream_read(struct erofs_iostream *ios, void **buf, u64 bytes)
 #if defined(HAVE_ZLIB)
 			ret = gzread(ios->handler, ios->buffer + rabytes,
 				     ios->bufsize - rabytes);
-			if (!ret) {
-				int errnum;
+			if (ret <= 0) {
 				const char *errstr;
+				int errnum;
 
 				errstr = gzerror(ios->handler, &errnum);
-				if (errnum != Z_STREAM_END) {
+				if (!ret && errnum == Z_STREAM_END) {
+					ios->feof = true;
+				} else {
 					erofs_err("failed to gzread: %s", errstr);
 					return -EIO;
 				}
-				ios->feof = true;
 			}
 			ios->tail += ret;
 #else
@@ -247,6 +252,7 @@ int erofs_iostream_read(struct erofs_iostream *ios, void **buf, u64 bytes)
 int erofs_iostream_bread(struct erofs_iostream *ios, void *buf, u64 bytes)
 {
 	u64 rem = bytes;
+	u8 *dst = buf;
 	void *src;
 	int ret;
 
@@ -254,7 +260,8 @@ int erofs_iostream_bread(struct erofs_iostream *ios, void *buf, u64 bytes)
 		ret = erofs_iostream_read(ios, &src, rem);
 		if (ret < 0)
 			return ret;
-		memcpy(buf, src, ret);
+		memcpy(dst, src, ret);
+		dst += ret;
 		rem -= ret;
 	} while (rem && ret);
 
@@ -411,7 +418,7 @@ int tarerofs_apply_xattrs(struct erofs_inode *inode, struct list_head *xattrs)
 		item->kv[item->namelen] = '\0';
 		erofs_dbg("Recording xattr(%s)=\"%s\" (of %u bytes) to file %s",
 			  item->kv, v, vsz, inode->i_srcpath);
-		ret = erofs_setxattr(inode, item->kv, v, vsz);
+		ret = erofs_vfs_setxattr(inode, item->kv, v, vsz);
 		if (ret == -ENODATA)
 			erofs_err("Failed to set xattr(%s)=%s to file %s",
 				  item->kv, v, inode->i_srcpath);
@@ -468,7 +475,7 @@ int tarerofs_parse_pax_header(struct erofs_iostream *ios,
 	char *buf, *p;
 	int ret;
 
-	buf = malloc(size);
+	buf = malloc((size_t)size + 1);
 	if (!buf)
 		return -ENOMEM;
 	p = buf;
@@ -476,10 +483,11 @@ int tarerofs_parse_pax_header(struct erofs_iostream *ios,
 	ret = erofs_iostream_bread(ios, buf, size);
 	if (ret != size)
 		goto out;
+	buf[size] = '\0';
 
 	while (p < buf + size) {
 		char *kv, *key, *value;
-		int len, n;
+		int len, n, j;
 		/* extended records are of the format: "LEN NAME=VALUE\n" */
 		ret = sscanf(p, "%d %n", &len, &n);
 		if (ret < 1 || len <= n || len > buf + size - p) {
@@ -506,17 +514,25 @@ int tarerofs_parse_pax_header(struct erofs_iostream *ios,
 			value++;
 
 			if (!strncmp(kv, "path=", sizeof("path=") - 1)) {
-				int j = p - 1 - value;
 				free(eh->path);
+				if (!*value) {
+					eh->path = NULL;
+					continue;
+				}
+				j = p - 1 - value;
 				eh->path = strdup(value);
-				while (eh->path[j - 1] == '/')
+				while (j && eh->path[j - 1] == '/')
 					eh->path[--j] = '\0';
 			} else if (!strncmp(kv, "linkpath=",
 					sizeof("linkpath=") - 1)) {
 				free(eh->link);
-				eh->link = strdup(value);
+				eh->link = *value ? strdup(value) : NULL;
 			} else if (!strncmp(kv, "mtime=",
 					sizeof("mtime=") - 1)) {
+				if (!*value) {
+					eh->use_mtime = false;
+					continue;
+				}
 				ret = sscanf(value, "%lld %n", &lln, &n);
 				if(ret < 1) {
 					ret = -EIO;
@@ -524,26 +540,62 @@ int tarerofs_parse_pax_header(struct erofs_iostream *ios,
 				}
 				eh->st.st_mtime = lln;
 				if (value[n] == '.') {
-					ret = sscanf(value + n + 1, "%d", &n);
-					if (ret < 1) {
+					unsigned int ns = 0;
+					int digits = 0;
+
+					while (value[n + 1] >= '0' &&
+					       value[n + 1] <= '9') {
+						if (digits < 9)
+							ns = ns * 10 + value[n + 1] - '0';
+						++digits;
+						++n;
+					}
+					if (!digits || value[n + 1] != '\0') {
 						ret = -EIO;
 						goto out;
 					}
-					ST_MTIM_NSEC_SET(&eh->st, n);
+					while (digits++ < 9)
+						ns *= 10;
+					if (ns && value[0] == '-') {
+						if (check_sub_overflow(eh->st.st_mtime, (time_t)1,
+								       &eh->st.st_mtime)) {
+							ret = -EIO;
+							goto out;
+						}
+						ns = 1000000000 - ns;
+					}
+					ST_MTIM_NSEC_SET(&eh->st, ns);
+				} else if (value[n] != '\0') {
+					ret = -EIO;
+					goto out;
 				} else {
 					ST_MTIM_NSEC_SET(&eh->st, 0);
 				}
 				eh->use_mtime = true;
 			} else if (!strncmp(kv, "size=",
 					sizeof("size=") - 1)) {
+				if (!*value) {
+					eh->use_size = false;
+					continue;
+				}
 				ret = sscanf(value, "%lld %n", &lln, &n);
 				if(ret < 1 || value[n] != '\0') {
 					ret = -EIO;
 					goto out;
 				}
+				if (lln < 0) {
+					erofs_err("invalid negative size=%lld in PAX header",
+						  lln);
+					ret = -EFSCORRUPTED;
+					goto out;
+				}
 				eh->st.st_size = lln;
 				eh->use_size = true;
 			} else if (!strncmp(kv, "uid=", sizeof("uid=") - 1)) {
+				if (!*value) {
+					eh->use_uid = false;
+					continue;
+				}
 				ret = sscanf(value, "%lld %n", &lln, &n);
 				if(ret < 1 || value[n] != '\0') {
 					ret = -EIO;
@@ -552,6 +604,10 @@ int tarerofs_parse_pax_header(struct erofs_iostream *ios,
 				eh->st.st_uid = lln;
 				eh->use_uid = true;
 			} else if (!strncmp(kv, "gid=", sizeof("gid=") - 1)) {
+				if (!*value) {
+					eh->use_gid = false;
+					continue;
+				}
 				ret = sscanf(value, "%lld %n", &lln, &n);
 				if(ret < 1 || value[n] != '\0') {
 					ret = -EIO;
@@ -624,31 +680,54 @@ static int tarerofs_write_uncompressed_file(struct erofs_inode *inode,
 					    struct erofs_tarfile *tar)
 {
 	struct erofs_sb_info *sbi = inode->sbi;
+	u8 ishare_xattr_prefix_id = sbi->ishare_xattr_prefix_id;
 	erofs_blk_t nblocks;
 	erofs_off_t pos;
 	void *buf;
 	int ret;
+	struct sha256_state md;
+	u8 out[32 + sizeof("sha256:") - 1];
 
 	inode->datalayout = EROFS_INODE_FLAT_PLAIN;
 	nblocks = DIV_ROUND_UP(inode->i_size, 1U << sbi->blkszbits);
 
-	ret = erofs_allocate_inode_bh_data(inode, nblocks);
+	ret = erofs_allocate_inode_bh_data(inode, nblocks, false);
 	if (ret)
 		return ret;
 
+	if (ishare_xattr_prefix_id)
+		erofs_sha256_init(&md);
+
 	for (pos = 0; pos < inode->i_size; pos += ret) {
 		ret = erofs_iostream_read(&tar->ios, &buf, inode->i_size - pos);
-		if (ret < 0)
+		if (ret <= 0) {
+			if (!ret)
+				ret = -EIO;
 			break;
+		}
 		if (erofs_dev_write(sbi, buf,
 				    erofs_pos(sbi, inode->u.i_blkaddr) + pos,
 				    ret)) {
 			ret = -EIO;
 			break;
 		}
+		if (ishare_xattr_prefix_id)
+			erofs_sha256_process(&md, buf, ret);
 	}
 	inode->idata_size = 0;
 	inode->datasource = EROFS_INODE_DATA_SOURCE_NONE;
+	if (ret < 0)
+		return ret;
+
+	if (ishare_xattr_prefix_id) {
+		erofs_sha256_done(&md, out + sizeof("sha256:") - 1);
+		memcpy(out, "sha256:", sizeof("sha256:") - 1);
+		ret = erofs_setxattr(inode, ishare_xattr_prefix_id, "",
+				     out, sizeof(out));
+		if (ret < 0)
+			return ret;
+	}
+
 	return 0;
 }
 
@@ -671,20 +750,25 @@ static int tarerofs_write_file_data(struct erofs_inode *inode,
 	if (fd < 0)
 		return -EBADF;
 
-	for (j = inode->i_size; j; ) {
+	j = inode->i_size;
+	DBG_BUGON(!j);
+	do {
 		nread = erofs_iostream_read(&tar->ios, &buf, j);
-		if (nread < 0)
+		if (nread <= 0) {
+			if (!nread)
+				nread = -EIO;
 			break;
+		}
 		if (pwrite(fd, buf, nread, off) != nread) {
 			nread = -EIO;
 			break;
 		}
 		j -= nread;
 		off += nread;
-	}
+	} while (j);
 	erofs_diskbuf_commit(inode->i_diskbuf, inode->i_size);
 	inode->datasource = EROFS_INODE_DATA_SOURCE_DISKBUF;
-	return 0;
+	return nread < 0 ? nread : 0;
 }
 
 int tarerofs_parse_tar(struct erofs_importer *im, struct erofs_tarfile *tar)
@@ -802,6 +886,13 @@ out_eot:
 			goto invalid_tar;
 	}
 
+	if ((s64)st.st_size < 0) {
+		erofs_err("invalid negative size=%lld @ %lld",
+			  (s64)st.st_size, tar_offset);
+		ret = -EFSCORRUPTED;
+		goto out;
+	}
+
 	if (th->typeflag <= '7' && !eh.path) {
 		eh.path = path;
 		j = 0;
@@ -855,6 +946,8 @@ out_eot:
 		st.st_mode = S_IFIFO;
 		break;
 	case 'g':
+		if ((u64)st.st_size >= UINT_MAX)
+			goto invalid_tar;
 		ret = tarerofs_parse_pax_header(&tar->ios, &tar->global,
 						st.st_size);
 		if (ret)
@@ -869,6 +962,8 @@ out_eot:
 		}
 		goto restart;
 	case 'x':
+		if ((u64)st.st_size >= UINT_MAX)
+			goto invalid_tar;
 		ret = tarerofs_parse_pax_header(&tar->ios, &eh, st.st_size);
 		if (ret)
 			goto out;
@@ -876,7 +971,8 @@ out_eot:
 	case 'L':
 		free(eh.path);
 		eh.path = malloc(st.st_size + 1);
-		if (st.st_size != erofs_iostream_bread(&tar->ios, eh.path,
+		if (!eh.path || st.st_size > PATH_MAX ||
+		    st.st_size != erofs_iostream_bread(&tar->ios, eh.path,
 						       st.st_size))
 			goto invalid_tar;
 		eh.path[st.st_size] = '\0';
@@ -884,8 +980,9 @@ out_eot:
 	case 'K':
 		free(eh.link);
 		eh.link = malloc(st.st_size + 1);
-		if (st.st_size > PATH_MAX || st.st_size !=
-		    erofs_iostream_bread(&tar->ios, eh.link, st.st_size))
+		if (!eh.link || st.st_size > PATH_MAX ||
+		    st.st_size != erofs_iostream_bread(&tar->ios, eh.link,
+						       st.st_size))
 			goto invalid_tar;
 		eh.link[st.st_size] = '\0';
 		goto restart;
@@ -947,7 +1044,7 @@ out_eot:
 			goto out;
 		}
 
-		st.st_rdev = (major << 8) | (minor & 0xff) | ((minor & ~0xff) << 12);
+		st.st_rdev = makedev(major, minor);
 	} else if (th->typeflag == '1' || th->typeflag == '2') {
 		if (!eh.link)
 			eh.link = strndup(th->linkname, sizeof(th->linkname));
@@ -995,30 +1092,37 @@ out_eot:
 			goto out;
 		}
 
-		if (d->type != EROFS_FT_UNKNOWN) {
-			tarerofs_remove_inode(d->inode);
-			erofs_iput(d->inode);
-		}
-		d->inode = NULL;
-
 		d2 = erofs_rebuild_get_dentry(root, eh.link, tar->aufs,
 					      &dumb, &dumb, false);
 		if (IS_ERR(d2)) {
 			ret = PTR_ERR(d2);
 			goto out;
 		}
+		if (!d2) {
+			ret = -EISDIR;
+			goto out;
+		}
 		if (d2->type == EROFS_FT_UNKNOWN) {
 			ret = -ENOENT;
+			goto out;
+		}
+		if (d == d2) {
+			ret = 0;
 			goto out;
 		}
 		if (S_ISDIR(d2->inode->i_mode)) {
 			ret = -EISDIR;
 			goto out;
 		}
+
 		inode = erofs_igrab(d2->inode);
+		++inode->i_nlink;
+		if (d->type != EROFS_FT_UNKNOWN) {
+			tarerofs_remove_inode(d->inode);
+			erofs_iput(d->inode);
+		}
 		d->inode = inode;
 		d->type = d2->type;
-		++inode->i_nlink;
 		ret = 0;
 		goto out;
 	} else if (d->type != EROFS_FT_UNKNOWN) {
@@ -1102,7 +1206,7 @@ new_inode:
 								 inode->i_size))
 					ret = -EIO;
 			} else if (tar->try_no_reorder &&
-				   !cfg.c_compr_opts[0].alg &&
+				   !sbi->available_compr_algs &&
 				   params->no_datainline) {
 				ret = tarerofs_write_uncompressed_file(inode, tar);
 			} else {

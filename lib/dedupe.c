@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0+ OR Apache-2.0
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
 /*
  * Copyright (C) 2022 Alibaba Cloud
  */
@@ -7,7 +7,7 @@
 #include "erofs/print.h"
 #include "rolling_hash.h"
 #include "liberofs_xxhash.h"
-#include "sha256.h"
+#include "liberofs_sha256.h"
 
 unsigned long erofs_memcmp2(const u8 *s1, const u8 *s2,
 			    unsigned long sz)

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0+ OR Apache-2.0
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
 /*
  * Created by Li Guifu <blucerlee@gmail.com>
  */
@@ -31,6 +31,7 @@ static int erofs_init_devices(struct erofs_sb_info *sbi,
 {
 	unsigned int ondisk_extradevs, i;
 	erofs_off_t pos;
+	bool _48bit = erofs_sb_has_48bit(sbi);
 
 	sbi->total_blocks = sbi->primarydevice_blocks;
 
@@ -65,8 +66,10 @@ static int erofs_init_devices(struct erofs_sb_info *sbi,
 			return ret;
 		}
 
-		sbi->devs[i].uniaddr = le32_to_cpu(dis.uniaddr_lo);
-		sbi->devs[i].blocks = le32_to_cpu(dis.blocks_lo);
+		sbi->devs[i].blocks = le32_to_cpu(dis.blocks_lo) |
+			(_48bit ? (u64)le16_to_cpu(dis.blocks_hi) << 32 : 0);
+		sbi->devs[i].uniaddr = le32_to_cpu(dis.uniaddr_lo) |
+			(_48bit ? (u64)le16_to_cpu(dis.uniaddr_hi) << 32 : 0);
 		memcpy(sbi->devs[i].tag, dis.tag, sizeof(dis.tag));
 		sbi->total_blocks += sbi->devs[i].blocks;
 		pos += EROFS_DEVT_SLOT_SIZE;
@@ -122,12 +125,14 @@ int erofs_read_superblock(struct erofs_sb_info *sbi)
 	sbi->xattr_prefix_count = dsb->xattr_prefix_count;
 	if (erofs_sb_has_48bit(sbi) && dsb->rootnid_8b) {
 		sbi->root_nid = le64_to_cpu(dsb->rootnid_8b);
-		sbi->primarydevice_blocks = (sbi->primarydevice_blocks << 32) |
-				le16_to_cpu(dsb->rb.blocks_hi);
+		sbi->primarydevice_blocks = sbi->primarydevice_blocks |
+				((u64)le16_to_cpu(dsb->rb.blocks_hi) << 32);
 	} else {
 		sbi->root_nid = le16_to_cpu(dsb->rb.rootnid_2b);
 	}
 	sbi->packed_nid = le64_to_cpu(dsb->packed_nid);
+	if (sbi->packed_nid & BIT_ULL(EROFS_DIRENT_NID_METABOX_BIT))
+		return -EFSCORRUPTED;
 	if (erofs_sb_has_metabox(sbi)) {
 		if (sbi->sb_size <= offsetof(struct erofs_super_block,
 					     metabox_nid))
@@ -146,7 +151,15 @@ int erofs_read_superblock(struct erofs_sb_info *sbi)
 	sbi->build_time = le32_to_cpu(dsb->build_time);
 
 	memcpy(&sbi->uuid, dsb->uuid, sizeof(dsb->uuid));
-
+	if (erofs_sb_has_ishare_xattrs(sbi)) {
+		if (dsb->ishare_xattr_prefix_id >= sbi->xattr_prefix_count) {
+			erofs_err("invalid ishare xattr prefix id %d",
+				  dsb->ishare_xattr_prefix_id);
+			return -EFSCORRUPTED;
+		}
+		sbi->ishare_xattr_prefix_id =
+			dsb->ishare_xattr_prefix_id | EROFS_XATTR_LONG_PREFIX;
+	}
 	ret = z_erofs_parse_cfgs(sbi, dsb);
 	if (ret)
 		return ret;
@@ -160,8 +173,13 @@ int erofs_read_superblock(struct erofs_sb_info *sbi)
 		free(sbi->devs);
 		sbi->devs = NULL;
 	}
-
 	sbi->sb_valid = !ret;
+	if (erofs_sb_has_48bit(sbi))
+		erofs_info("EXPERIMENTAL 48-bit layout support in use. Use at your own risk!");
+	if (erofs_sb_has_metabox(sbi)) {
+		erofs_info("EXPERIMENTAL metadata compression support in use. Use at your own risk!");
+		erofs_info("No in-memory cache for metadata compression: userspace parser for metabox remains slow.");
+	}
 	return ret;
 }
 
@@ -206,6 +224,8 @@ int erofs_writesb(struct erofs_sb_info *sbi)
 		.extra_devices = cpu_to_le16(sbi->extra_devices),
 		.devt_slotoff = cpu_to_le16(sbi->devt_slotoff),
 		.packed_nid = cpu_to_le64(sbi->packed_nid),
+		.ishare_xattr_prefix_id = sbi->ishare_xattr_prefix_id &
+			EROFS_XATTR_LONG_PREFIX_MASK,
 	};
 	char *buf;
 	int ret;
@@ -391,8 +411,11 @@ int erofs_write_device_table(struct erofs_sb_info *sbi)
 
 	if (!sbi->extra_devices)
 		goto out;
-	if (!bh)
+	if (!bh) {
+		if (erofs_sb_has_device_table(sbi))
+			return 0;
 		return -EINVAL;
+	}
 
 	pos = erofs_btell(bh, false);
 	if (pos == EROFS_NULL_ADDR) {
@@ -405,6 +428,8 @@ int erofs_write_device_table(struct erofs_sb_info *sbi)
 		struct erofs_deviceslot dis = {
 			.uniaddr_lo = cpu_to_le32(nblocks),
 			.blocks_lo = cpu_to_le32(sbi->devs[i].blocks),
+			.blocks_hi = cpu_to_le16(sbi->devs[i].blocks >> 32),
+			.uniaddr_hi = cpu_to_le16(nblocks >> 32),
 		};
 
 		memcpy(dis.tag, sbi->devs[i].tag, sizeof(dis.tag));
@@ -436,9 +461,9 @@ int erofs_mkfs_format_fs(struct erofs_sb_info *sbi, unsigned int blkszbits,
 	sbi->bmgr = bmgr;
 	bmgr->dsunit = dsunit;
 	if (metazone)
-		sbi->meta_blkaddr = EROFS_META_NEW_ADDR;
+		sbi->metazone_startblk = EROFS_META_NEW_ADDR;
 	else
-		sbi->meta_blkaddr = 0;
+		sbi->metazone_startblk = 0;
 	bh = erofs_reserve_sb(bmgr);
 	if (IS_ERR(bh))
 		return PTR_ERR(bh);

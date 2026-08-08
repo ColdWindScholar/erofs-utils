@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0+
+// SPDX-License-Identifier: MIT
 /*
  * Created by Li Guifu <blucerlee@gmail.com>
  * Lowlevel added by Li Yiyan <lyy0627@sjtu.edu.cn>
@@ -265,8 +265,10 @@ static void erofsfuse_getattr(fuse_req_t req, fuse_ino_t ino,
 	struct erofs_inode vi = { .sbi = &g_sbi, .nid = erofsfuse_to_nid(ino) };
 
 	ret = erofs_read_inode_from_disk(&vi);
-	if (ret < 0)
+	if (ret < 0) {
 		fuse_reply_err(req, -ret);
+		return;
+	}
 
 	erofsfuse_fill_stat(&vi, &stbuf);
 	stbuf.st_ino = ino;

@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: GPL-2.0+ OR Apache-2.0 */
+/* SPDX-License-Identifier: GPL-2.0+ OR MIT */
 /*
  * Copyright (C) 2018 HUAWEI, Inc.
  *             http://www.huawei.com/
@@ -15,6 +15,10 @@ extern "C"
 #include <errno.h>
 #include <string.h>
 #include <stdio.h>
+
+#ifndef ENODATA
+#define ENODATA ENOATTR
+#endif
 
 static inline const char *erofs_strerror(int err)
 {
@@ -48,6 +52,9 @@ static inline void * ERR_CAST(const void *ptr)
 	/* cast away the const */
 	return (void *) ptr;
 }
+
+/* EROFS-specific error codes */
+#define EROFS_RETVAL_FALLBACK		MAX_ERRNO
 
 #ifdef __cplusplus
 }

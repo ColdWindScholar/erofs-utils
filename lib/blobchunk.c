@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0+ OR Apache-2.0
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
 /*
  * erofs-utils/lib/blobchunk.c
  *
@@ -11,7 +11,7 @@
 #include "erofs/importer.h"
 #include "liberofs_cache.h"
 #include "liberofs_private.h"
-#include "sha256.h"
+#include "liberofs_sha256.h"
 #include <unistd.h>
 
 struct erofs_blobchunk {
@@ -134,6 +134,42 @@ static int erofs_blob_hashmap_cmp(const void *a, const void *b,
 
 	return memcmp(ec1->sha256, key ? key : ec2->sha256,
 		      sizeof(ec1->sha256));
+}
+
+void erofs_inode_fixup_chunkformat(struct erofs_inode *inode)
+{
+	unsigned int unit, src;
+	u64 extent_count;
+	bool _48bit;
+
+	if (inode->u.chunkformat & EROFS_CHUNK_FORMAT_INDEXES)
+		unit = sizeof(struct erofs_inode_chunk_index);
+	else
+		unit = EROFS_BLOCK_MAP_ENTRY_SIZE;
+
+	_48bit = inode->u.chunkformat & EROFS_CHUNK_FORMAT_48BIT;
+	if (_48bit)
+		return;
+
+	extent_count = inode->extent_isize / unit;
+	for (src = 0; src < extent_count; ++src) {
+		struct erofs_blobchunk *chunk =
+			*(void **)(inode->chunkindexes + src * sizeof(void *));
+
+		if (chunk->blkaddr == EROFS_NULL_ADDR)
+			continue;
+		if (chunk->device_id) {
+			if (chunk->blkaddr > UINT32_MAX) {
+				_48bit = true;
+				break;
+			}
+		} else if (remapped_base + chunk->blkaddr > UINT32_MAX) {
+			_48bit = true;
+			break;
+		}
+	}
+	if (_48bit)
+		inode->u.chunkformat |= EROFS_CHUNK_FORMAT_48BIT;
 }
 
 int erofs_write_chunk_indexes(struct erofs_inode *inode, struct erofs_vfile *vf,
@@ -277,14 +313,12 @@ int erofs_blob_write_chunked_file(struct erofs_inode *inode, int fd,
 	u8 *chunkdata;
 	int ret;
 
-#ifdef SEEK_DATA
 	/* if the file is fully sparsed, use one big chunk instead */
 	if (lseek(fd, startoff, SEEK_DATA) < 0 && errno == ENXIO) {
 		chunkbits = ilog2(inode->i_size - 1) + 1;
 		if (chunkbits < sbi->blkszbits)
 			chunkbits = sbi->blkszbits;
 	}
-#endif
 	if (chunkbits - sbi->blkszbits > EROFS_CHUNK_FORMAT_BLKBITS_MASK)
 		chunkbits = EROFS_CHUNK_FORMAT_BLKBITS_MASK + sbi->blkszbits;
 	chunksize = 1ULL << chunkbits;
@@ -327,12 +361,12 @@ int erofs_blob_write_chunked_file(struct erofs_inode *inode, int fd,
 				  erofs_strerror(ret));
 			goto err;
 		}
-		erofs_dbg("Align /%s on block #%d (0x%llx)",
-			  erofs_fspath(inode->i_srcpath), erofs_blknr(sbi, off), off);
+		erofs_dbg("Align /%s on block #%llu (0x%llx)",
+			  erofs_fspath(inode->i_srcpath),
+			  erofs_blknr(sbi, off) | 0ULL, off);
 	}
 
 	for (pos = 0; pos < inode->i_size; pos += len) {
-#ifdef SEEK_DATA
 		off_t offset = lseek(fd, pos + startoff, SEEK_DATA);
 
 		if (offset < 0) {
@@ -369,7 +403,6 @@ int erofs_blob_write_chunked_file(struct erofs_inode *inode, int fd,
 			len = 0;
 			continue;
 		}
-#endif
 
 		len = min_t(u64, inode->i_size - pos, chunksize);
 		ret = read(fd, chunkdata, len);
@@ -384,10 +417,6 @@ int erofs_blob_write_chunked_file(struct erofs_inode *inode, int fd,
 			goto err;
 		}
 
-		/* FIXME! `chunk->blkaddr` is not the final blkaddr here */
-		if (chunk->blkaddr != EROFS_NULL_ADDR &&
-		    chunk->blkaddr >= UINT32_MAX)
-			inode->u.chunkformat |= EROFS_CHUNK_FORMAT_48BIT;
 		if (!erofs_blob_can_merge(sbi, lastch, chunk)) {
 			erofs_update_minextblks(sbi, interval_start, pos,
 						&minextblks);
@@ -502,6 +531,16 @@ int tarerofs_write_chunkes(struct erofs_inode *inode, erofs_off_t data_offset)
 		*(void **)idx++ = chunk;
 		blkaddr += erofs_blknr(sbi, len);
 		data_offset += len;
+	}
+
+	/*
+	 * XXX: it's safe for now, but we really need to refactor blobchunk
+	 * after 1.9 is out.
+	 */
+	if (blkaddr > UINT32_MAX) {
+		inode->u.chunkformat |= EROFS_CHUNK_FORMAT_48BIT;
+		erofs_info("48-bit block addressin enabled for indexing larger tar");
+		erofs_sb_set_48bit(sbi);
 	}
 	inode->datalayout = EROFS_INODE_CHUNK_BASED;
 	return 0;

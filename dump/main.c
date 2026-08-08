@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0+
+// SPDX-License-Identifier: MIT
 /*
  * Copyright (C) 2021-2022 HUAWEI, Inc.
  *             http://www.huawei.com/
@@ -17,7 +17,13 @@
 #include "../lib/liberofs_private.h"
 #include "../lib/liberofs_uuid.h"
 
+struct erofsdump_dirstack {
+       erofs_nid_t dirs[PATH_MAX];
+       int top;
+};
+
 struct erofsdump_cfg {
+	struct erofsdump_dirstack dirstack;
 	unsigned int totalshow;
 	bool show_inode;
 	bool show_extent;
@@ -96,7 +102,10 @@ static struct erofsdump_feature feature_lists[] = {
 	{  true,    0, EROFS_FEATURE_COMPAT_SB_CHKSUM, "sb_csum" },
 	{  true,    0, EROFS_FEATURE_COMPAT_MTIME, "mtime" },
 	{  true,    0, EROFS_FEATURE_COMPAT_XATTR_FILTER, "xattr_filter" },
-	{ false, 504U, EROFS_FEATURE_INCOMPAT_ZERO_PADDING, "0padding" },
+	{  true,    0, EROFS_FEATURE_COMPAT_SHARED_EA_IN_METABOX, "shared_ea_in_metabox" },
+	{  true,    0, EROFS_FEATURE_COMPAT_PLAIN_XATTR_PFX, "plain_xattr_pfx" },
+	{  true,    0, EROFS_FEATURE_COMPAT_ISHARE_XATTRS, "ishare_xattrs" },
+	{ false, 504U, EROFS_FEATURE_INCOMPAT_LZ4_0PADDING, "lz4_0padding" },
 	{ false, 513U, EROFS_FEATURE_INCOMPAT_COMPR_CFGS, "compr_cfgs" },
 	{ false, 513U, EROFS_FEATURE_INCOMPAT_BIG_PCLUSTER, "big_pcluster" },
 	{ false, 515U, EROFS_FEATURE_INCOMPAT_CHUNKED_FILE, "chunked_file" },
@@ -356,7 +365,6 @@ static int erofsdump_readdir(struct erofs_dir_context *ctx)
 		update_file_size_statistics(occupied_size, false);
 	}
 
-	/* XXXX: the dir depth should be restricted in order to avoid loops */
 	if (S_ISDIR(vi.i_mode)) {
 		struct erofs_dir_context nctx = {
 			.flags = ctx->dir ? EROFS_READDIR_VALID_PNID : 0,
@@ -364,8 +372,18 @@ static int erofsdump_readdir(struct erofs_dir_context *ctx)
 			.dir = &vi,
 			.cb = erofsdump_dirent_iter,
 		};
+		int i, ret;
 
-		return erofs_iterate_dir(&nctx, false);
+		/* XXX: support the deeper cases later */
+		if (dumpcfg.dirstack.top >= ARRAY_SIZE(dumpcfg.dirstack.dirs))
+			return -ENAMETOOLONG;
+		for (i = 0; i < dumpcfg.dirstack.top; ++i)
+			if (vi.nid == dumpcfg.dirstack.dirs[i])
+				return -ELOOP;
+		dumpcfg.dirstack.dirs[dumpcfg.dirstack.top++] = nctx.pnid;
+		ret = erofs_iterate_dir(&nctx, false);
+		--dumpcfg.dirstack.top;
+		return ret;
 	}
 	return 0;
 }
@@ -519,10 +537,7 @@ static void erofsdump_filesize_distribution(const char *title,
 		memset(col4, 0, sizeof(col4));
 		if (i == len - 1)
 			sprintf(col1, "%6d ..", lowerbound);
-		else if (i <= 6)
-			sprintf(col1, "%6d .. %-6d", lowerbound, upperbound);
 		else
-
 			sprintf(col1, "%6d .. %-6d", lowerbound, upperbound);
 		col2 = file_counts[i];
 		if (stats.file_category_stat[EROFS_FT_REG_FILE])
@@ -675,12 +690,21 @@ static void erofsdump_show_superblock(void)
 			g_sbi.inos | 0ULL);
 	fprintf(stdout, "Filesystem created:                           %s",
 			ctime(&time));
-	fprintf(stdout, "Filesystem features:                          ");
+	fprintf(stdout, "Filesystem compatible features:               ");
 	for (i = 0; i < ARRAY_SIZE(feature_lists); i++) {
-		u32 feat = le32_to_cpu(feature_lists[i].compat ?
-				       g_sbi.feature_compat :
-				       g_sbi.feature_incompat);
-		if (feat & feature_lists[i].flag) {
+		if (!feature_lists[i].compat)
+			continue;
+		if (le32_to_cpu(g_sbi.feature_compat) & feature_lists[i].flag) {
+			fprintf(stdout, "%s ", feature_lists[i].name);
+			if (feature_lists[i].lkver > minkver)
+				minkver = feature_lists[i].lkver;
+		}
+	}
+	fprintf(stdout, "\nFilesystem incompatible features:             ");
+	for (i = 0; i < ARRAY_SIZE(feature_lists); i++) {
+		if (feature_lists[i].compat)
+			continue;
+		if (le32_to_cpu(g_sbi.feature_incompat) & feature_lists[i].flag) {
 			fprintf(stdout, "%s ", feature_lists[i].name);
 			if (feature_lists[i].lkver > minkver)
 				minkver = feature_lists[i].lkver;

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0+ OR Apache-2.0
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
 /*
  * erofs-utils/lib/kite_deflate.c
  *
@@ -144,7 +144,7 @@ static void writebits(struct kite_deflate *s, unsigned int v, u8 bits)
 {
 	unsigned int rem = sizeof(s->inflightbits) * 8 - s->bitpos;
 
-	s->inflightbits |= (v << s->bitpos) & (!rem - 1);
+	s->inflightbits |= rem ? (v << s->bitpos) : 0;
 	if (bits > rem) {
 		u8 *out = s->out + s->pos_out;
 

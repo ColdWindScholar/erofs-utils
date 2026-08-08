@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0+
+// SPDX-License-Identifier: MIT
 /*
  * Copyright (C) 2018-2019 HUAWEI, Inc.
  *             http://www.huawei.com/
@@ -34,6 +34,8 @@
 #include "../lib/liberofs_s3.h"
 #include "../lib/liberofs_uuid.h"
 
+#define EROFS_EA_INODE_DIGEST_DEFAULT "erofs.fingerprint.v1"
+
 static struct option long_options[] = {
 	{"version", no_argument, 0, 'V'},
 	{"help", no_argument, 0, 'h'},
@@ -61,7 +63,6 @@ static struct option long_options[] = {
 	{"tar", optional_argument, NULL, 20},
 	{"aufs", no_argument, NULL, 21},
 	{"mount-point", required_argument, NULL, 512},
-	{"xattr-prefix", required_argument, NULL, 19},
 #ifdef WITH_ANDROID
 	{"product-out", required_argument, NULL, 513},
 	{"fs-config-file", required_argument, NULL, 514},
@@ -101,7 +102,9 @@ static struct option long_options[] = {
 	{"oci", optional_argument, NULL, 534},
 #endif
 	{"zD", optional_argument, NULL, 536},
-	{"ZI", optional_argument, NULL, 537},
+	{"MZ", optional_argument, NULL, 537},
+	{"xattr-prefix", required_argument, NULL, 538},
+	{"xattr-inode-digest", optional_argument, NULL, 539},
 	{0, 0, 0, 0},
 };
 
@@ -165,96 +168,104 @@ static void usage(int argc, char **argv)
 				printf("%s  [,dictsize=<dictsize>]\t(default=<auto>, max=%u)\n",
 				       spaces, s->c->max_dictsize);
 		}
+		if (!strcmp(s->name, "lzma")) {
+			printf("\n%s  LZMA advanced options (do not specify if unsure):\n", spaces);
+			printf("%s  [,lc=<n>]  n = number of literal context bits\n", spaces);
+			printf("%s  [,lp=<n>]  n = number of literal position bits\n", spaces);
+			printf("%s  [,pb=<n>]  n = number of position bits\n", spaces);
+		}
 	}
 	printf(
-		" -C#                   specify the size of compress physical cluster in bytes\n"
-		" -EX[,...]             X=extended options\n"
-		" -L volume-label       set the volume label (maximum 15 bytes)\n"
-		" -m#[:X]               enable metadata compression (# = physical cluster size in bytes;\n"
-		"                                                    X = another compression algorithm for metadata)\n"
-		" -T#                   specify a fixed UNIX timestamp # as build time\n"
-		"    --all-time         the timestamp is also applied to all files (default)\n"
-		"    --mkfs-time        the timestamp is applied as build time only\n"
-		" -UX                   use a given filesystem UUID\n"
-		" --zD[=<0|1>]          specify directory compression: 0=disable [default], 1=enable\n"
-		" --ZI[=<0|1>]          specify the separate inode metadata zone availability: 0=disable [default], 1=enable\n"
-		" --all-root            make all files owned by root\n"
+		" -C#                    specify the size of compress physical cluster in bytes\n"
+		" -EX[,...]              X=extended options\n"
+		" -L volume-label        set the volume label (maximum 15 bytes)\n"
+		" -m#[:X]                enable metadata compression (# = physical cluster size in bytes;\n"
+		"                                                     X = another compression algorithm for metadata)\n"
+		" -T#                    specify a fixed UNIX timestamp # as build time\n"
+		"    --all-time          the timestamp is also applied to all files (default)\n"
+		"    --mkfs-time         the timestamp is applied as build time only\n"
+		" -UX                    use a given filesystem UUID\n"
+		" --zD[=<0|1>]           specify directory compression: 0=disable [default], 1=enable\n"
+		" --MZ[=<0|[id]>]        put inode metadata ('i') and/or directory data ('d') into the separate metadata zone.\n"
+		" --all-root             make all files owned by root\n"
 #ifdef EROFS_MT_ENABLED
-		" --async-queue-limit=# specify the maximum number of entries in the multi-threaded job queue\n"
+		" --async-queue-limit=#  specify the maximum number of entries in the multi-threaded job queue\n"
 #endif
-		" --blobdev=X           specify an extra device X to store chunked data\n"
-		" --chunksize=#         generate chunk-based files with #-byte chunks\n"
-		" --clean=X             run full clean build (default) or:\n"
-		" --incremental=X       run incremental build\n"
-		"                       X = data|rvsp|0 (data: full data, rvsp: space fallocated\n"
-		"                                        0: inodes zeroed)\n"
-		" --compress-hints=X    specify a file to configure per-file compression strategy\n"
-		" --dsunit=#            align all data block addresses to multiples of #\n"
-		" --exclude-path=X      avoid including file X (X = exact literal path)\n"
-		" --exclude-regex=X     avoid including files that match X (X = regular expression)\n"
+		" --blobdev=X            specify an extra device X to store chunked data\n"
+		" --chunksize=#          generate chunk-based files with #-byte chunks\n"
+		" --clean=X              run full clean build (default) or:\n"
+		" --incremental=X        run incremental build\n"
+		"                        X = data|rvsp|0 (data: full data, rvsp: space fallocated\n"
+		"                                         0: inodes zeroed)\n"
+		" --compress-hints=X     specify a file to configure per-file compression strategy\n"
+		" --dsunit=#             align all data block addresses to multiples of #\n"
+		" --exclude-path=X       avoid including file X (X = exact literal path)\n"
+		" --exclude-regex=X      avoid including files that match X (X = regular expression)\n"
 #ifdef HAVE_LIBSELINUX
-		" --file-contexts=X     specify a file contexts file to setup selinux labels\n"
+		" --file-contexts=X      specify a file contexts file to setup selinux labels\n"
 #endif
-		" --force-uid=#         set all file uids to # (# = UID)\n"
-		" --force-gid=#         set all file gids to # (# = GID)\n"
-		" --fsalignblks=#       specify the alignment of the primary device size in blocks\n"
-		" --uid-offset=#        add offset # to all file uids (# = id offset)\n"
-		" --gid-offset=#        add offset # to all file gids (# = id offset)\n"
-		" --hard-dereference    dereference hardlinks, add links as separate inodes\n"
-		" --ignore-mtime        use build time instead of strict per-file modification time\n"
-		" --max-extent-bytes=#  set maximum decompressed extent size # in bytes\n"
-		" --mount-point=X       X=prefix of target fs path (default: /)\n"
-		" --preserve-mtime      keep per-file modification time strictly\n"
-		" --offset=#            skip # bytes at the beginning of IMAGE.\n"
-		" --root-xattr-isize=#  ensure the inline xattr size of the root directory is # bytes at least\n"
-		" --aufs                replace aufs special files with overlayfs metadata\n"
-		" --sort=<path,none>    data sorting order for tarballs as input (default: path)\n"
+		" --force-uid=#          set all file uids to # (# = UID)\n"
+		" --force-gid=#          set all file gids to # (# = GID)\n"
+		" --fsalignblks=#        specify the alignment of the primary device size in blocks\n"
+		" --uid-offset=#         add offset # to all file uids (# = id offset)\n"
+		" --gid-offset=#         add offset # to all file gids (# = id offset)\n"
+		" --hard-dereference     dereference hardlinks, add links as separate inodes\n"
+		" --ignore-mtime         use build time instead of strict per-file modification time\n"
+		" --max-extent-bytes=#   set maximum decompressed extent size # in bytes\n"
+		" --mount-point=X        X=prefix of target fs path (default: /)\n"
+		" --preserve-mtime       keep per-file modification time strictly\n"
+		" --offset=#             skip # bytes at the beginning of IMAGE.\n"
+		" --root-xattr-isize=#   ensure the inline xattr size of the root directory is # bytes at least\n"
+		" --aufs                 replace aufs special files with overlayfs metadata\n"
+		" --sort=<path,none>     data sorting order for tarballs as input (default: path)\n"
 #ifdef S3EROFS_ENABLED
-		" --s3=X                generate an image from S3-compatible object store\n"
-		"   [,passwd_file=Y]    X=endpoint, Y=s3fs-compatible password file\n"
-		"   [,urlstyle=Z]       S3 API calling style (Z = vhost|path) (default: vhost)\n"
-		"   [,sig=<2,4>]        S3 API signature version (default: 2)\n"
-		"   [,region=W]         W=region code in which endpoint belongs to (required for sig=4)\n"
+		" --s3=X                 generate an image from S3-compatible object store\n"
+		"   [,passwd_file=Y]     X=endpoint, Y=s3fs-compatible password file\n"
+		"   [,urlstyle=Z]        S3 API calling style (Z = vhost|path) (default: vhost)\n"
+		"   [,sig=<2,4>]         S3 API signature version (default: 2)\n"
+		"   [,region=W]          W=region code in which endpoint belongs to (required for sig=4)\n"
 #endif
 #ifdef OCIEROFS_ENABLED
-		" --oci=[f|i]           generate a full (f) or index-only (i) image from OCI remote source\n"
-		"   [,=platform=X]      X=platform (default: linux/amd64)\n"
-		"   [,layer=#]          #=layer index to extract (0-based; omit to extract all layers)\n"
-		"   [,blob=Y]           Y=blob digest to extract (omit to extract all layers)\n"
-		"   [,username=Z]       Z=username for authentication (optional)\n"
-		"   [,password=W]       W=password for authentication (optional)\n"
+		" --oci=[f|i]            generate a full (f) or index-only (i) image from OCI remote source\n"
+		"   [,platform=X]        X=platform (default: linux/amd64)\n"
+		"   [,layer=#]           #=layer index to extract (0-based; omit to extract all layers)\n"
+		"   [,blob=Y]            Y=blob digest to extract (omit to extract all layers)\n"
+		"   [,username=Z]        Z=username for authentication (optional)\n"
+		"   [,password=W]        W=password for authentication (optional)\n"
+		"   [,insecure]          use HTTP instead of HTTPS (optional)\n"
 #endif
-		" --tar=X               generate a full or index-only image from a tarball(-ish) source\n"
-		"                       (X = f|i|headerball; f=full mode, i=index mode,\n"
-		"                                            headerball=file data is omited in the source stream)\n"
-		" --ovlfs-strip=<0,1>   strip overlayfs metadata in the target image (e.g. whiteouts)\n"
-		" --quiet               quiet execution (do not write anything to standard output.)\n"
+		" --tar=X                generate a full or index-only image from a tarball(-ish) source\n"
+		"                        (X = f|i|headerball; f=full mode, i=index mode,\n"
+		"                                             headerball=file data is omitted in the source stream)\n"
+		" --ovlfs-strip=<0,1>    strip overlayfs metadata in the target image (e.g. whiteouts)\n"
+		" --quiet                quiet execution (do not write anything to standard output.)\n"
 #ifndef NDEBUG
-		" --random-pclusterblks randomize pclusterblks for big pcluster (debugging only)\n"
-		" --random-algorithms   randomize per-file algorithms (debugging only)\n"
+		" --random-pclusterblks  randomize pclusterblks for big pcluster (debugging only)\n"
+		" --random-algorithms    randomize per-file algorithms (debugging only)\n"
 #endif
 #ifdef HAVE_ZLIB
-		" --ungzip[=X]          try to filter the tarball stream through gzip\n"
-		"                       (and optionally dump the raw stream to X together)\n"
+		" --ungzip[=X]           try to filter the tarball stream through gzip\n"
+		"                        (and optionally dump the raw stream to X together)\n"
 #endif
 #ifdef HAVE_LIBLZMA
-		" --unxz[=X]            try to filter the tarball stream through xz/lzma/lzip\n"
-		"                       (and optionally dump the raw stream to X together)\n"
+		" --unxz[=X]             try to filter the tarball stream through xz/lzma/lzip\n"
+		"                        (and optionally dump the raw stream to X together)\n"
 #endif
 #ifdef HAVE_ZLIB
-		" --gzinfo[=X]          generate AWS SOCI-compatible zinfo in order to support random gzip access\n"
+		" --gzinfo[=X]           generate AWS SOCI-compatible zinfo in order to support random gzip access\n"
 #endif
-		" --vmdk-desc=X         generate a VMDK descriptor file to merge sub-filesystems\n"
+		" --vmdk-desc=X          generate a VMDK descriptor file to merge sub-filesystems\n"
 #ifdef EROFS_MT_ENABLED
-		" --workers=#           set the number of worker threads to # (default: %u)\n"
+		" --workers=#            set the number of worker threads to # (default: %u)\n"
 #endif
-		" --xattr-prefix=X      X=extra xattr name prefix\n"
-		" --zfeature-bits=#     toggle filesystem compression features according to given bits #\n"
+		" --xattr-inode-digest=X specify extended attribute name X (\"" EROFS_EA_INODE_DIGEST_DEFAULT "\" if omitted) to record inode digests\n"
+		" --xattr-prefix=X       X=extra xattr name prefix\n"
+		" --zfeature-bits=#      toggle filesystem compression features according to given bits #\n"
 #ifdef WITH_ANDROID
 		"\n"
 		"Android-specific options:\n"
-		" --product-out=X       X=product_out directory\n"
-		" --fs-config-file=X    X=fs_config file\n"
+		" --product-out=X        X=product_out directory\n"
+		" --fs-config-file=X     X=fs_config file\n"
 #endif
 #ifdef EROFS_MT_ENABLED
 		, erofs_get_available_processors() /* --workers= */
@@ -270,11 +281,15 @@ static void version(void)
 }
 
 static struct erofsmkfs_cfg {
+	struct z_erofs_paramset zcfgs[EROFS_MAX_COMPR_CFGS + 1];
 	/* < 0, xattr disabled and >= INT_MAX, always use inline xattrs */
 	long inlinexattr_tolerance;
 	bool inode_metazone;
+	u64 unix_timestamp;
+	unsigned int total_zcfgs;
 } mkfscfg = {
 	.inlinexattr_tolerance = 2,
+	.unix_timestamp = -1,
 };
 
 static unsigned int pclustersize_packed, pclustersize_max;
@@ -309,7 +324,7 @@ static enum {
 	EROFS_MKFS_SOURCE_REBUILD,
 } source_mode;
 
-static unsigned int rebuild_src_count, total_ccfgs;
+static unsigned int rebuild_src_count;
 static LIST_HEAD(rebuild_src_list);
 static u8 fixeduuid[16];
 static bool valid_fixeduuid;
@@ -324,9 +339,9 @@ static int erofs_mkfs_feat_set_legacy_compress(struct erofs_importer_params *par
 {
 	if (vallen)
 		return -EINVAL;
-	/* disable compacted indexes and 0padding */
-	params->no_zcompact = true;
-	params->no_lz4_0padding = true;
+	if (en)
+		erofs_warn("ancient !lz4_0padding layout (< Linux 5.4) is no longer supported");
+	params->no_zcompact = en;
 	return 0;
 }
 
@@ -338,6 +353,29 @@ static int erofs_mkfs_feat_set_ztailpacking(struct erofs_importer_params *params
 		return -EINVAL;
 
 	params->ztailpacking = en;
+	return 0;
+}
+
+static int erofs_mkfs_strtoull(const char *nptr, char **endptr,
+			       unsigned long long *res, int base)
+{
+	char *end;
+	unsigned long long number;
+
+	errno = 0;
+	number = strtoull(nptr, &end, base);
+	if (errno)
+		return -errno;
+
+	if (*end == 'k' || *end == 'K')
+		number <<= 10, ++end;
+	else if (*end == 'm' || *end == 'M')
+		number <<= 20, ++end;
+	else if (*end == 'g' || *end == 'G')
+		number <<= 30, ++end;
+	*res = number;
+	if (endptr)
+		*endptr = end;
 	return 0;
 }
 
@@ -353,10 +391,12 @@ static int erofs_mkfs_feat_set_fragments(struct erofs_importer_params *params,
 	}
 
 	if (vallen) {
+		unsigned long long i;
 		char *endptr;
-		u64 i = strtoull(val, &endptr, 0);
+		int err;
 
-		if (endptr - val != vallen) {
+		err = erofs_mkfs_strtoull(val, &endptr, &i, 0);
+		if (err || endptr - val != vallen) {
 			erofs_err("invalid pcluster size %s for the packed file", val);
 			return -EINVAL;
 		}
@@ -596,67 +636,6 @@ static void mkfs_parse_tar_cfg(char *cfg)
 }
 
 #ifdef S3EROFS_ENABLED
-static int mkfs_parse_s3_cfg_passwd(const char *filepath, char *ak, char *sk)
-{
-	struct stat st;
-	int fd, n, ret;
-	char buf[S3_ACCESS_KEY_LEN + S3_SECRET_KEY_LEN + 3];
-	char *colon;
-
-	fd = open(filepath, O_RDONLY);
-	if (fd < 0) {
-		erofs_err("failed to open passwd_file %s", filepath);
-		return -errno;
-	}
-
-	ret = fstat(fd, &st);
-	if (ret) {
-		ret = -errno;
-		goto err;
-	}
-
-	if (!S_ISREG(st.st_mode)) {
-		erofs_err("%s is not a regular file", filepath);
-		ret = -EINVAL;
-		goto err;
-	}
-
-	if ((st.st_mode & 077) != 0)
-		erofs_warn("passwd_file %s should not be accessible by group or others",
-			   filepath);
-
-	if (st.st_size > S3_ACCESS_KEY_LEN + S3_SECRET_KEY_LEN + 3) {
-		erofs_err("passwd_file %s is too large (size: %llu)", filepath,
-			  st.st_size | 0ULL);
-		ret = -EINVAL;
-		goto err;
-	}
-
-	n = read(fd, buf, st.st_size);
-	if (n < 0) {
-		ret = -errno;
-		goto err;
-	}
-	buf[n] = '\0';
-
-	while (n > 0 && (buf[n - 1] == '\n' || buf[n - 1] == '\r'))
-		buf[--n] = '\0';
-
-	colon = strchr(buf, ':');
-	if (!colon) {
-		ret = -EINVAL;
-		goto err;
-	}
-	*colon = '\0';
-
-	strcpy(ak, buf);
-	strcpy(sk, colon + 1);
-
-err:
-	close(fd);
-	return ret;
-}
-
 static int mkfs_parse_s3_cfg(char *cfg_str)
 {
 	char *p, *q, *opt;
@@ -690,8 +669,8 @@ static int mkfs_parse_s3_cfg(char *cfg_str)
 
 		if ((p = strstr(opt, "passwd_file="))) {
 			p += sizeof("passwd_file=") - 1;
-			ret = mkfs_parse_s3_cfg_passwd(p, s3cfg.access_key,
-						       s3cfg.secret_key);
+			ret = s3erofs_parse_s3fs_passwd(p, s3cfg.access_key,
+							s3cfg.secret_key);
 			if (ret)
 				return ret;
 		} else if ((p = strstr(opt, "urlstyle="))) {
@@ -735,6 +714,59 @@ static int mkfs_parse_s3_cfg(char *cfg_str)
 }
 #endif
 
+static int erofs_mkfs_strtoll(const char *nptr, char **endptr,
+			      long long *res, int base)
+{
+	char *end;
+	long long number;
+
+	errno = 0;
+	number = strtoll(nptr, &end, base);
+	if (errno)
+		return -errno;
+
+	if (*end == 'k' || *end == 'K')
+		number *= 1024, ++end;
+	else if (*end == 'm' || *end == 'M')
+		number *= 1048576, ++end;
+	else if (*end == 'g' || *end == 'G')
+		number *= 1073741824, ++end;
+	*res = number;
+	if (endptr)
+		*endptr = end;
+	return 0;
+}
+
+static int erofs_mkfs_strtol(const char *nptr, char **endptr,
+			     long *res, int base)
+{
+	long long res_ll;
+	int ret;
+
+	ret = erofs_mkfs_strtoll(nptr, endptr, &res_ll, base);
+	if (ret)
+		return ret;
+	if (res_ll > LONG_MAX || res_ll < LONG_MIN)
+		return -ERANGE;
+	*res = res_ll;
+	return 0;
+}
+
+static int erofs_mkfs_strtou32(const char *nptr, char **endptr,
+			       u32 *res, int base)
+{
+	unsigned long long res_ull;
+	int ret;
+
+	ret = erofs_mkfs_strtoull(nptr, endptr, &res_ull, base);
+	if (ret)
+		return ret;
+	if (res_ull > UINT32_MAX)
+		return -ERANGE;
+	*res = res_ull;
+	return 0;
+}
+
 #ifdef OCIEROFS_ENABLED
 /*
  * mkfs_parse_oci_options - Parse comma-separated OCI options string
@@ -744,7 +776,7 @@ static int mkfs_parse_s3_cfg(char *cfg_str)
  * Parse OCI options string containing comma-separated key=value pairs.
  *
  * Supported options include f|i, platform, blob|layer, username, password,
- * and zinfo.
+ * and insecure.
  *
  * Return: 0 on success, negative errno on failure
  */
@@ -752,9 +784,12 @@ static int mkfs_parse_oci_options(struct ocierofs_config *oci_cfg, char *options
 {
 	char *opt, *q, *p;
 	long idx;
+	int ret;
 
 	if (!options_str)
 		return 0;
+
+	oci_cfg->layer_index = -1;
 
 	opt = options_str;
 	q = strchr(opt, ',');
@@ -772,67 +807,55 @@ static int mkfs_parse_oci_options(struct ocierofs_config *oci_cfg, char *options
 		if (q)
 			*q = '\0';
 
-
-		p = strstr(opt, "platform=");
-		if (p) {
+		if ((p = strstr(opt, "platform="))) {
 			p += strlen("platform=");
 			free(oci_cfg->platform);
 			oci_cfg->platform = strdup(p);
 			if (!oci_cfg->platform)
 				return -ENOMEM;
-		} else {
-			p = strstr(opt, "blob=");
-			if (p) {
-				p += strlen("blob=");
-				free(oci_cfg->blob_digest);
+		} else if ((p = strstr(opt, "blob="))) {
+			p += strlen("blob=");
+			free(oci_cfg->blob_digest);
 
-				if (oci_cfg->layer_index >= 0) {
-					erofs_err("invalid --oci: blob and layer cannot be set together");
-					return -EINVAL;
-				}
-
-				if (!strncmp(p, "sha256:", 7)) {
-					oci_cfg->blob_digest = strdup(p);
-					if (!oci_cfg->blob_digest)
-						return -ENOMEM;
-				} else if (asprintf(&oci_cfg->blob_digest, "sha256:%s", p) < 0) {
-					return -ENOMEM;
-				}
-			} else {
-				p = strstr(opt, "layer=");
-				if (p) {
-					p += strlen("layer=");
-					if (oci_cfg->blob_digest) {
-						erofs_err("invalid --oci: layer and blob cannot be set together");
-						return -EINVAL;
-					}
-					idx = strtol(p, NULL, 10);
-					if (idx < 0)
-						return -EINVAL;
-					oci_cfg->layer_index = (int)idx;
-				} else {
-					p = strstr(opt, "username=");
-					if (p) {
-						p += strlen("username=");
-						free(oci_cfg->username);
-						oci_cfg->username = strdup(p);
-						if (!oci_cfg->username)
-							return -ENOMEM;
-					} else {
-						p = strstr(opt, "password=");
-						if (p) {
-							p += strlen("password=");
-							free(oci_cfg->password);
-							oci_cfg->password = strdup(p);
-							if (!oci_cfg->password)
-								return -ENOMEM;
-						} else {
-							erofs_err("mkfs: invalid --oci value %s", opt);
-							return -EINVAL;
-						}
-					}
-				}
+			if (oci_cfg->layer_index >= 0) {
+				erofs_err("invalid --oci: blob and layer cannot be set together");
+				return -EINVAL;
 			}
+
+			if (!strncmp(p, "sha256:", 7)) {
+				oci_cfg->blob_digest = strdup(p);
+				if (!oci_cfg->blob_digest)
+					return -ENOMEM;
+			} else if (asprintf(&oci_cfg->blob_digest, "sha256:%s", p) < 0) {
+				return -ENOMEM;
+			}
+		} else if ((p = strstr(opt, "layer="))) {
+			p += strlen("layer=");
+			if (oci_cfg->blob_digest) {
+				erofs_err("invalid --oci: layer and blob cannot be set together");
+				return -EINVAL;
+			}
+			ret = erofs_mkfs_strtol(p, NULL, &idx, 10);
+			if (ret || idx < 0)
+				return -EINVAL;
+			oci_cfg->layer_index = (int)idx;
+		} else if ((p = strstr(opt, "username="))) {
+			p += strlen("username=");
+			free(oci_cfg->username);
+			oci_cfg->username = strdup(p);
+			if (!oci_cfg->username)
+				return -ENOMEM;
+		} else if ((p = strstr(opt, "password="))) {
+			p += strlen("password=");
+			free(oci_cfg->password);
+			oci_cfg->password = strdup(p);
+			if (!oci_cfg->password)
+				return -ENOMEM;
+		} else if ((p = strstr(opt, "insecure"))) {
+			oci_cfg->insecure = true;
+		} else {
+			erofs_err("mkfs: invalid --oci value %s", opt);
+			return -EINVAL;
 		}
 
 		opt = q ? q + 1 : NULL;
@@ -842,66 +865,75 @@ static int mkfs_parse_oci_options(struct ocierofs_config *oci_cfg, char *options
 }
 #endif
 
-static int mkfs_parse_one_compress_alg(char *alg,
-				       struct erofs_compr_opts *copts)
+struct z_erofs_paramset erofs_mkfs_zparams[EROFS_MAX_COMPR_CFGS + 1];
+unsigned int erofs_mkfs_total_ccfgs;
+
+static int mkfs_parse_one_compress_alg(char *alg)
 {
+	struct z_erofs_paramset *zset = mkfscfg.zcfgs + mkfscfg.total_zcfgs;
+	char extraopts[48];
 	char *p, *q, *opt, *endptr;
+	int i, j;
 
-	copts->level = -1;
-	copts->dict_size = 0;
-
-	p = strchr(alg, ',');
-	if (p) {
-		copts->alg = strndup(alg, p - alg);
-
-		/* support old '-zlzma,9' form */
-		if (isdigit(*(p + 1))) {
-			copts->level = strtol(p + 1, &endptr, 10);
-			if (*endptr && *endptr != ',') {
-				erofs_err("invalid compression level %s",
-					  p + 1);
-				return -EINVAL;
-			}
-			return 0;
-		}
-	} else {
-		copts->alg = strdup(alg);
-		return 0;
+	if (zset >= erofs_mkfs_zparams + ARRAY_SIZE(erofs_mkfs_zparams)) {
+		erofs_err("too many algorithm types");
+		return -EINVAL;
 	}
+	zset->clevel = -1;
+	zset->dict_size = 0;
 
-	opt = p + 1;
-	while (opt) {
-		q = strchr(opt, ',');
-		if (q)
-			*q = '\0';
-
-		if ((p = strstr(opt, "level="))) {
-			p += strlen("level=");
-			copts->level = strtol(p, &endptr, 10);
-			if ((endptr == p) || (*endptr && *endptr != ',')) {
+	i = 0;
+	p = strchr(alg, ',');
+	if (!p) {
+		zset->alg = alg;
+	} else {
+		*p++ = '\0';
+		zset->alg = alg;
+		if (isdigit(*p)) {	/* support old '-zlzma,9' form */
+			zset->clevel = strtol(p, &endptr, 10);
+			if (*endptr && *endptr != ',') {
 				erofs_err("invalid compression level %s", p);
 				return -EINVAL;
 			}
-		} else if ((p = strstr(opt, "dictsize="))) {
-			p += strlen("dictsize=");
-			copts->dict_size = strtoul(p, &endptr, 10);
-			if (*endptr == 'k' || *endptr == 'K')
-				copts->dict_size <<= 10;
-			else if (*endptr == 'm' || *endptr == 'M')
-				copts->dict_size <<= 20;
-			else if ((endptr == p) || (*endptr && *endptr != ',')) {
-				erofs_err("invalid compression dictsize %s", p);
-				return -EINVAL;
-			}
 		} else {
-			erofs_err("invalid compression option %s", opt);
-			return -EINVAL;
+			for (opt = p; opt;) {
+				q = strchr(opt, ',');
+				if (q)
+					*q = '\0';
+
+				if ((p = strstr(opt, "level="))) {
+					p += strlen("level=");
+					zset->clevel = strtol(p, &endptr, 10);
+					if ((endptr == p) || (*endptr && *endptr != ',')) {
+						erofs_err("invalid compression level %s", p);
+						return -EINVAL;
+					}
+				} else if ((p = strstr(opt, "dictsize="))) {
+					p += strlen("dictsize=");
+					j = erofs_mkfs_strtou32(p, &endptr, &zset->dict_size, 0);
+					if (j < 0 || (*endptr != '\0' && endptr != q)) {
+						erofs_err("invalid compression dictsize %s", p);
+						return -EINVAL;
+					}
+				} else {
+					if (i)
+						j = snprintf(extraopts + i, sizeof(extraopts) - i, ",%s", opt);
+					else
+						j = snprintf(extraopts, sizeof(extraopts), "%s", opt);
+					if (j < 0)
+						return -ERANGE;
+					i += j;
+				}
+				opt = q ? q + 1 : NULL;
+			}
 		}
-
-		opt = q ? q + 1 : NULL;
 	}
-
-	return 0;
+	if (i) {
+		zset->extraopts = strdup(extraopts);
+		if (!zset->extraopts)
+			return -ENOMEM;
+	}
+	return mkfscfg.total_zcfgs++;
 }
 
 static int mkfs_parse_compress_algs(char *algs)
@@ -910,15 +942,9 @@ static int mkfs_parse_compress_algs(char *algs)
 	int ret;
 
 	for (s = strtok(algs, ":"); s; s = strtok(NULL, ":")) {
-		if (total_ccfgs >= EROFS_MAX_COMPR_CFGS - 1) {
-			erofs_err("too many algorithm types");
-			return -EINVAL;
-		}
-
-		ret = mkfs_parse_one_compress_alg(s, &cfg.c_compr_opts[total_ccfgs]);
-		if (ret)
+		ret = mkfs_parse_one_compress_alg(s);
+		if (ret < 0)
 			return ret;
-		++total_ccfgs;
 	}
 	return 0;
 }
@@ -1062,8 +1088,9 @@ static int mkfs_parse_options_cfg(struct erofs_importer_params *params,
 			break;
 
 		case 'b':
-			i = atoi(optarg);
-			if (i < 512 || i > EROFS_MAX_BLOCK_SIZE) {
+			err = erofs_mkfs_strtol(optarg, &endptr, &i, 0);
+			if (err || *endptr != '\0' || i < 512 ||
+			    i > EROFS_MAX_BLOCK_SIZE) {
 				erofs_err("invalid block size %s", optarg);
 				return -EINVAL;
 			}
@@ -1105,8 +1132,8 @@ static int mkfs_parse_options_cfg(struct erofs_importer_params *params,
 			break;
 
 		case 'T':
-			cfg.c_unix_timestamp = strtoull(optarg, &endptr, 0);
-			if (cfg.c_unix_timestamp == -1 || *endptr != '\0') {
+			mkfscfg.unix_timestamp = strtoull(optarg, &endptr, 0);
+			if (mkfscfg.unix_timestamp == -1 || *endptr != '\0') {
 				erofs_err("invalid UNIX timestamp %s", optarg);
 				return -EINVAL;
 			}
@@ -1172,13 +1199,14 @@ static int mkfs_parse_options_cfg(struct erofs_importer_params *params,
 			break;
 #endif
 		case 9:
-			cfg.c_max_decompressed_extent_bytes =
-				strtoul(optarg, &endptr, 0);
-			if (*endptr != '\0') {
-				erofs_err("invalid maximum uncompressed extent size %s",
+			err = erofs_mkfs_strtol(optarg, &endptr, &i, 0);
+			if (err || *endptr != '\0' ||
+			    i > INT32_MAX || i < INT32_MIN) {
+				erofs_err("invalid maximum compressed extent size %s",
 					  optarg);
 				return -EINVAL;
 			}
+			params->max_compressed_extent_size = i;
 			break;
 		case 10:
 			cfg.c_compress_hints_file = optarg;
@@ -1199,8 +1227,8 @@ static int mkfs_parse_options_cfg(struct erofs_importer_params *params,
 			break;
 #endif
 		case 'C':
-			i = strtoull(optarg, &endptr, 0);
-			if (*endptr != '\0') {
+			err = erofs_mkfs_strtol(optarg, &endptr, &i, 0);
+			if (err || *endptr != '\0' || i <= 0) {
 				erofs_err("invalid physical clustersize %s",
 					  optarg);
 				return -EINVAL;
@@ -1215,14 +1243,19 @@ static int mkfs_parse_options_cfg(struct erofs_importer_params *params,
 				metabox_algorithmid =
 					strtoul(algid + 1, &endptr, 0);
 				if (*endptr != '\0') {
-					err = mkfs_parse_one_compress_alg(algid + 1,
-							&cfg.c_compr_opts[total_ccfgs]);
-					if (err)
+					err = mkfs_parse_one_compress_alg(algid + 1);
+					if (err < 0)
 						return err;
-					metabox_algorithmid = total_ccfgs++;
+					metabox_algorithmid = err;
 				}
 			}
-			pclustersize_metabox = atoi(optarg);
+			err = erofs_mkfs_strtol(optarg, &endptr, &i, 0);
+			if (err || (*endptr != '\0' && algid != endptr) ||
+			    i <= 0) {
+				erofs_err("invalid metabox option %s", optarg);
+				return -EINVAL;
+			}
+			pclustersize_metabox = i;
 			break;
 		}
 
@@ -1267,16 +1300,6 @@ static int mkfs_parse_options_cfg(struct erofs_importer_params *params,
 				erofs_err("invalid gid offset %s", optarg);
 				return -EINVAL;
 			}
-			break;
-		case 19:
-			errno = 0;
-			opt = erofs_xattr_insert_name_prefix(optarg);
-			if (opt) {
-				erofs_err("failed to parse xattr name prefix: %s",
-					  erofs_strerror(opt));
-				return opt;
-			}
-			cfg.c_extra_ea_name_prefixes = true;
 			break;
 		case 20:
 			mkfs_parse_tar_cfg(optarg);
@@ -1428,10 +1451,48 @@ static int mkfs_parse_options_cfg(struct erofs_importer_params *params,
 			}
 			break;
 		case 537:
-			if (!optarg || strcmp(optarg, "1"))
+			if (!optarg) {
 				mkfscfg.inode_metazone = true;
-			else
+				params->dirdata_in_metazone = true;
+			} else if (!strcmp(optarg, "0")) {
 				mkfscfg.inode_metazone = false;
+				params->dirdata_in_metazone = false;
+			} else {
+				for (i = 0; optarg[i]; ++i) {
+					if (optarg[i] == 'i') {
+						mkfscfg.inode_metazone = true;
+					} else if (optarg[i] == 'd') {
+						params->dirdata_in_metazone = true;
+					} else {
+						erofs_err("invalid metazone flags `%s`", optarg);
+						return -EINVAL;
+					}
+				}
+				if (params->dirdata_in_metazone && !mkfscfg.inode_metazone) {
+					erofs_err("inode metadata must be in the metadata zone if directory data is stored there");
+					return -EINVAL;
+				}
+			}
+			break;
+		case 538:
+			errno = 0;
+			opt = erofs_xattr_insert_name_prefix(optarg);
+			if (opt < 0) {
+				erofs_err("failed to parse xattr name prefix: %s",
+					  erofs_strerror(opt));
+				return opt;
+			}
+			cfg.c_extra_ea_name_prefixes = true;
+			break;
+		case 539:
+			if (!optarg)
+				optarg = EROFS_EA_INODE_DIGEST_DEFAULT;
+			err = erofs_xattr_set_ishare_prefix(&g_sbi, optarg);
+			if (err < 0) {
+				erofs_err("failed to parse ishare name: %s",
+					  erofs_strerror(err));
+				return err;
+			}
 			break;
 		case 'V':
 			version();
@@ -1563,7 +1624,7 @@ static void erofs_mkfs_default_options(struct erofs_importer_params *params)
 	mkfs_blkszbits = ilog2(min_t(u32, getpagesize(), EROFS_MAX_BLOCK_SIZE));
 	params->pclusterblks_max = 1U;
 	params->pclusterblks_def = 1U;
-	g_sbi.feature_incompat = EROFS_FEATURE_INCOMPAT_ZERO_PADDING;
+	g_sbi.feature_incompat = 0;
 	g_sbi.feature_compat = EROFS_FEATURE_COMPAT_SB_CHKSUM |
 			     EROFS_FEATURE_COMPAT_MTIME;
 }
@@ -1585,7 +1646,7 @@ int parse_source_date_epoch(void)
 			  source_date_epoch);
 		return -EINVAL;
 	}
-	cfg.c_unix_timestamp = epoch;
+	mkfscfg.unix_timestamp = epoch;
 	cfg.c_timeinherit = TIMESTAMP_CLAMPING;
 	return 0;
 }
@@ -1620,7 +1681,9 @@ static int erofs_mkfs_rebuild_load_trees(struct erofs_inode *root)
 	}
 
 	list_for_each_entry(src, &rebuild_src_list, list) {
+		src->xamgr = g_sbi.xamgr;
 		ret = erofs_rebuild_load_tree(root, src, datamode);
+		src->xamgr = NULL;
 		if (ret) {
 			erofs_err("failed to load %s", src->devname);
 			return ret;
@@ -1633,7 +1696,7 @@ static int erofs_mkfs_rebuild_load_trees(struct erofs_inode *root)
 		extra_devices += src->extra_devices;
 	}
 
-	if (datamode != EROFS_REBUILD_DATA_BLOB_INDEX)
+	if (datamode == EROFS_REBUILD_DATA_RESVSP)
 		return 0;
 
 	/* Each blob has either no extra device or only one device for TarFS */
@@ -1642,6 +1705,9 @@ static int erofs_mkfs_rebuild_load_trees(struct erofs_inode *root)
 			  extra_devices, rebuild_src_count);
 		return -EOPNOTSUPP;
 	}
+
+	if (datamode == EROFS_REBUILD_DATA_FULL)
+		return 0;
 
 	ret = erofs_mkfs_init_devices(&g_sbi, rebuild_src_count);
 	if (ret)
@@ -1665,16 +1731,7 @@ static int erofs_mkfs_rebuild_load_trees(struct erofs_inode *root)
 			memcpy(devs[idx].tag, tag, sizeof(devs[0].tag));
 		else
 			/* convert UUID of the source image to a hex string */
-			sprintf((char *)g_sbi.devs[idx].tag,
-				"%04x%04x%04x%04x%04x%04x%04x%04x",
-				(src->uuid[0] << 8) | src->uuid[1],
-				(src->uuid[2] << 8) | src->uuid[3],
-				(src->uuid[4] << 8) | src->uuid[5],
-				(src->uuid[6] << 8) | src->uuid[7],
-				(src->uuid[8] << 8) | src->uuid[9],
-				(src->uuid[10] << 8) | src->uuid[11],
-				(src->uuid[12] << 8) | src->uuid[13],
-				(src->uuid[14] << 8) | src->uuid[15]);
+			erofs_uuid_unparse_as_tag(src->uuid, (char *)devs[idx].tag);
 	}
 	return 0;
 }
@@ -1711,7 +1768,6 @@ int main(int argc, char **argv)
 	bool tar_index_512b = false;
 	struct timeval t;
 	FILE *blklst = NULL;
-	s64 mkfs_time = 0;
 	int err;
 	u32 crc;
 
@@ -1736,17 +1792,12 @@ int main(int argc, char **argv)
 	}
 
 	g_sbi.fixed_nsec = 0;
-	if (cfg.c_unix_timestamp != -1) {
-		mkfs_time = cfg.c_unix_timestamp;
-	} else if (!gettimeofday(&t, NULL)) {
-		mkfs_time = t.tv_sec;
-	}
-	if (erofs_sb_has_48bit(&g_sbi)) {
-		g_sbi.epoch = max_t(s64, 0, mkfs_time - UINT32_MAX);
-		g_sbi.build_time = mkfs_time - g_sbi.epoch;
-	} else {
-		g_sbi.epoch = mkfs_time;
-	}
+	if (mkfscfg.unix_timestamp != -1)
+		importer_params.build_time = mkfscfg.unix_timestamp;
+	else if (!gettimeofday(&t, NULL))
+		importer_params.build_time = t.tv_sec;
+	else
+		importer_params.build_time = 0;
 
 	err = erofs_dev_open(&g_sbi, cfg.c_img_path, O_RDWR |
 				(incremental_mode ? 0 : O_TRUNC));
@@ -1841,6 +1892,7 @@ int main(int argc, char **argv)
 
 	if (mkfscfg.inlinexattr_tolerance < 0)
 		importer_params.no_xattrs = true;
+	importer_params.z_paramsets = mkfscfg.zcfgs;
 	importer_params.source = cfg.c_src_path;
 	importer_params.no_datainline = mkfs_no_datainline;
 	importer_params.dot_omitted = mkfs_dot_omitted;
@@ -1849,7 +1901,7 @@ int main(int argc, char **argv)
 		goto exit;
 
 	if (importer_params.dedupe == EROFS_DEDUPE_FORCE_ON) {
-		if (!cfg.c_compr_opts[0].alg) {
+		if (!g_sbi.available_compr_algs) {
 			erofs_err("Compression is not enabled.  Turn on chunk-based data deduplication instead.");
 			cfg.c_chunkbits = g_sbi.blkszbits;
 		} else {
@@ -1887,9 +1939,13 @@ int main(int argc, char **argv)
 			goto exit;
 		}
 
-		if (cfg.c_extra_ea_name_prefixes)
-			erofs_xattr_flush_name_prefixes(&importer,
-							mkfs_plain_xattr_pfx);
+		err = erofs_xattr_flush_name_prefixes(&importer,
+						      mkfs_plain_xattr_pfx);
+		if (err) {
+			erofs_err("failed to flush long xattr prefixes: %s",
+				  erofs_strerror(err));
+			goto exit;
+		}
 
 		root = erofs_new_inode(&g_sbi);
 		if (IS_ERR(root)) {
@@ -1897,7 +1953,15 @@ int main(int argc, char **argv)
 			goto exit;
 		}
 	} else {
-		root = erofs_rebuild_make_root(&g_sbi);
+		err = erofs_xattr_flush_name_prefixes(&importer,
+						      mkfs_plain_xattr_pfx);
+		if (err) {
+			erofs_err("failed to flush long xattr prefixes: %s",
+				  erofs_strerror(err));
+			goto exit;
+		}
+
+		root = erofs_make_empty_root_inode(&importer, &g_sbi);
 		if (IS_ERR(root)) {
 			err = PTR_ERR(root);
 			goto exit;
@@ -2006,7 +2070,6 @@ exit:
 	blklst = erofs_blocklist_close();
 	if (blklst)
 		fclose(blklst);
-	erofs_dev_close(&g_sbi);
 	erofs_cleanup_compress_hints();
 	erofs_cleanup_exclude_rules();
 	if (cfg.c_chunkbits || source_mode == EROFS_MKFS_SOURCE_REBUILD)
@@ -2042,6 +2105,7 @@ exit:
 		erofs_mkfs_showsummaries();
 	}
 	erofs_put_super(&g_sbi);
+	erofs_dev_close(&g_sbi);
 	liberofs_global_exit();
 	return err;
 }

@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: GPL-2.0+ OR Apache-2.0
+# SPDX-License-Identifier: GPL-2.0+ OR MIT
 
 noinst_LTLIBRARIES = liberofs.la
 noinst_HEADERS = $(top_srcdir)/include/erofs_fs.h \
@@ -33,9 +33,14 @@ noinst_HEADERS = $(top_srcdir)/include/erofs_fs.h \
       $(top_srcdir)/lib/liberofs_gzran.h \
       $(top_srcdir)/lib/liberofs_metabox.h \
       $(top_srcdir)/lib/liberofs_nbd.h \
-      $(top_srcdir)/lib/liberofs_s3.h
+      $(top_srcdir)/lib/liberofs_s3.h \
+      $(top_srcdir)/lib/liberofs_ublk.h
 
 noinst_HEADERS += compressor.h
+if ENABLE_FANOTIFY
+noinst_HEADERS += $(top_srcdir)/lib/liberofs_fanotify.h
+endif
+
 liberofs_la_SOURCES = config.c io.c cache.c super.c inode.c xattr.c exclude.c \
 		      namei.c data.c compress.c compressor.c zmap.c decompress.c \
 		      compress_hints.c hashmap.c sha256.c blobchunk.c dir.c \
@@ -44,9 +49,7 @@ liberofs_la_SOURCES = config.c io.c cache.c super.c inode.c xattr.c exclude.c \
 		      vmdk.c metabox.c global.c importer.c base64.c
 
 liberofs_la_CFLAGS = -Wall ${libuuid_CFLAGS} -I$(top_srcdir)/include
-liberofs_la_LDFLAGS = ${libselinux_LIBS} ${libuuid_LIBS} ${liblz4_LIBS} \
-	${liblzma_LIBS} ${zlib_LIBS} ${libdeflate_LIBS} ${libzstd_LIBS} \
-	${libqpl_LIBS}
+liberofs_la_LIBADD = $(LIBEROFS_LIBS)
 if ENABLE_LZ4
 liberofs_la_CFLAGS += ${liblz4_CFLAGS}
 liberofs_la_SOURCES += compressor_lz4.c
@@ -70,33 +73,42 @@ liberofs_la_SOURCES += compressor_libzstd.c
 endif
 if ENABLE_XXHASH
 liberofs_la_CFLAGS += ${libxxhash_CFLAGS}
-liberofs_la_LDFLAGS += ${libxxhash_LIBS}
 else
 liberofs_la_SOURCES += xxhash.c
 endif
 liberofs_la_CFLAGS += ${libcurl_CFLAGS} ${openssl_CFLAGS} ${libxml2_CFLAGS}
-liberofs_la_LDFLAGS += ${libcurl_LIBS} ${openssl_LIBS}
 if ENABLE_S3
 liberofs_la_SOURCES += remotes/s3.c
-liberofs_la_LDFLAGS += ${libxml2_LIBS}
 endif
 if ENABLE_EROFS_MT
-liberofs_la_LDFLAGS += -lpthread
 liberofs_la_SOURCES += workqueue.c
 endif
 if OS_LINUX
 liberofs_la_CFLAGS += ${libnl3_CFLAGS}
-liberofs_la_LDFLAGS += ${libnl3_LIBS}
 liberofs_la_SOURCES += backends/nbd.c
+if ENABLE_FANOTIFY
+liberofs_la_SOURCES += backends/fanotify.c
 endif
-liberofs_la_SOURCES += remotes/oci.c
+endif
+
+if ENABLE_UBLK
+liberofs_la_CFLAGS += ${liburing_CFLAGS}
+liberofs_la_SOURCES += backends/ublk.c
+endif
+liberofs_la_SOURCES += remotes/oci.c remotes/docker_config.c
 liberofs_la_CFLAGS += ${json_c_CFLAGS}
-liberofs_la_LDFLAGS += ${json_c_LIBS}
 liberofs_la_SOURCES += gzran.c
 
 if ENABLE_S3
-noinst_PROGRAMS  = s3erofs_test
+noinst_PROGRAMS = s3erofs_test
 s3erofs_test_SOURCES = remotes/s3.c
 s3erofs_test_CFLAGS = -Wall -I$(top_srcdir)/include ${libxml2_CFLAGS} ${openssl_CFLAGS} -DTEST
-s3erofs_test_LDADD = liberofs.la
+s3erofs_test_LDADD = liberofs.la $(LIBEROFS_LIBS)
+endif
+
+if ENABLE_OCI
+noinst_PROGRAMS = ocierofs_test
+ocierofs_test_SOURCES = remotes/oci.c
+ocierofs_test_CFLAGS = -Wall -I$(top_srcdir)/include ${json_c_CFLAGS} -DTEST
+ocierofs_test_LDADD = liberofs.la $(LIBEROFS_LIBS)
 endif

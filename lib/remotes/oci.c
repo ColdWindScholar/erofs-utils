@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0+ OR Apache-2.0
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
 /*
  * Copyright (C) 2025 Tencent, Inc.
  *             http://www.tencent.com/
@@ -26,13 +26,11 @@
 #include "erofs/tar.h"
 #include "liberofs_base64.h"
 #include "liberofs_oci.h"
+#include "liberofs_dockerconfig.h"
 #include "liberofs_private.h"
 #include "liberofs_gzran.h"
 
 #ifdef OCIEROFS_ENABLED
-
-#define DOCKER_REGISTRY "docker.io"
-#define DOCKER_API_REGISTRY "registry-1.docker.io"
 
 #define DOCKER_MEDIATYPE_MANIFEST_V2 \
 	"application/vnd.docker.distribution.manifest.v2+json"
@@ -496,8 +494,8 @@ static char *ocierofs_discover_auth_endpoint(struct ocierofs_ctx *ctx,
 
 	api_registry = ocierofs_get_api_registry(registry);
 
-	if (asprintf(&test_url, "https://%s/v2/%s/manifests/nonexistent",
-	     api_registry, repository) < 0)
+	if (asprintf(&test_url, "%s%s/v2/%s/manifests/nonexistent",
+	     ctx->schema, api_registry, repository) < 0)
 		return NULL;
 
 	curl_easy_reset(ctx->curl);
@@ -528,9 +526,9 @@ static char *ocierofs_get_auth_token(struct ocierofs_ctx *ctx, const char *regis
 				     const char *password)
 {
 	static const char * const auth_patterns[] = {
-		"https://%s/v2/auth",
-		"https://auth.%s/token",
-		"https://%s/token",
+		"%s%s/v2/auth",
+		"%sauth.%s/token",
+		"%s%s/token",
 		NULL,
 	};
 	char *auth_header = NULL;
@@ -561,8 +559,8 @@ static char *ocierofs_get_auth_token(struct ocierofs_ctx *ctx, const char *regis
 
 		api_registry = ocierofs_get_api_registry(registry);
 
-		if (asprintf(&test_url, "https://%s/v2/%s/manifests/nonexistent",
-		     api_registry, repository) >= 0) {
+		if (asprintf(&test_url, "%s%s/v2/%s/manifests/nonexistent",
+		     ctx->schema, api_registry, repository) >= 0) {
 			curl_easy_reset(ctx->curl);
 			ocierofs_curl_setup_common_options(ctx->curl);
 
@@ -598,7 +596,7 @@ static char *ocierofs_get_auth_token(struct ocierofs_ctx *ctx, const char *regis
 	for (i = 0; auth_patterns[i]; i++) {
 		char *auth_url;
 
-		if (asprintf(&auth_url, auth_patterns[i], registry) < 0)
+		if (asprintf(&auth_url, auth_patterns[i], ctx->schema, registry) < 0)
 			continue;
 
 		auth_header = ocierofs_get_auth_token_with_url(ctx, auth_url,
@@ -629,8 +627,8 @@ static char *ocierofs_get_manifest_digest(struct ocierofs_ctx *ctx,
 	int ret = 0, len, i;
 
 	api_registry = ocierofs_get_api_registry(registry);
-	if (asprintf(&req.url, "https://%s/v2/%s/manifests/%s",
-	     api_registry, repository, tag) < 0)
+	if (asprintf(&req.url, "%s%s/v2/%s/manifests/%s",
+	     ctx->schema, api_registry, repository, tag) < 0)
 		return ERR_PTR(-ENOMEM);
 
 	if (auth_header && strstr(auth_header, "Bearer"))
@@ -694,10 +692,20 @@ static char *ocierofs_get_manifest_digest(struct ocierofs_ctx *ctx,
 		    json_object_object_get_ex(manifest, "digest", &digest_obj)) {
 			const char *arch = json_object_get_string(arch_obj);
 			const char *os = json_object_get_string(os_obj);
+			json_object *variant_obj;
+			const char *variant = NULL;
 			char manifest_platform[64];
 
-			snprintf(manifest_platform, sizeof(manifest_platform),
-				 "%s/%s", os, arch);
+			if (json_object_object_get_ex(platform_obj, "variant", &variant_obj))
+				variant = json_object_get_string(variant_obj);
+
+			if (variant)
+				snprintf(manifest_platform, sizeof(manifest_platform),
+					 "%s/%s/%s", os, arch, variant);
+			else
+				snprintf(manifest_platform, sizeof(manifest_platform),
+					 "%s/%s", os, arch);
+
 			if (!strcmp(manifest_platform, platform)) {
 				digest = strdup(json_object_get_string(digest_obj));
 				break;
@@ -749,8 +757,8 @@ static int ocierofs_fetch_layers_info(struct ocierofs_ctx *ctx)
 	ctx->layer_count = 0;
 	api_registry = ocierofs_get_api_registry(registry);
 
-	if (asprintf(&req.url, "https://%s/v2/%s/manifests/%s",
-		     api_registry, repository, digest) < 0)
+	if (asprintf(&req.url, "%s%s/v2/%s/manifests/%s",
+		     ctx->schema, api_registry, repository, digest) < 0)
 		return -ENOMEM;
 
 	if (auth_header && strstr(auth_header, "Bearer"))
@@ -954,9 +962,21 @@ static int ocierofs_find_layer_by_digest(struct ocierofs_ctx *ctx, const char *d
 static int ocierofs_prepare_layers(struct ocierofs_ctx *ctx,
 				   const struct ocierofs_config *config)
 {
+	struct erofs_docker_credential dcred = { NULL, NULL };
+	const char *username = config->username;
+	const char *password = config->password;
 	int ret;
 
-	ret = ocierofs_prepare_auth(ctx, config->username, config->password);
+	/* Fallback to Docker config.json if no CLI credentials provided */
+	if ((!username || !*username) && (!password || !*password)) {
+		if (!erofs_docker_config_lookup(ctx->registry, &dcred)) {
+			username = dcred.username;
+			password = dcred.password;
+		}
+	}
+
+	ret = ocierofs_prepare_auth(ctx, username, password);
+	erofs_docker_credential_free(&dcred);
 	if (ret)
 		return ret;
 
@@ -1027,7 +1047,7 @@ out_auth:
  */
 static int ocierofs_parse_ref(struct ocierofs_ctx *ctx, const char *ref_str)
 {
-	char *slash, *colon, *dot;
+	const char *slash, *colon, *dot;
 	const char *repo_part;
 	size_t len;
 	char *tmp;
@@ -1038,7 +1058,9 @@ static int ocierofs_parse_ref(struct ocierofs_ctx *ctx, const char *ref_str)
 	slash = strchr(ref_str, '/');
 	if (slash) {
 		dot = strchr(ref_str, '.');
-		if (dot && dot < slash) {
+		colon = strchr(ref_str, ':');
+		/* a dot or colon before the slash indicating a registry */
+		if ((dot && dot < slash) || (colon && colon < slash)) {
 			len = slash - ref_str;
 			tmp = strndup(ref_str, len);
 			if (!tmp)
@@ -1057,64 +1079,84 @@ static int ocierofs_parse_ref(struct ocierofs_ctx *ctx, const char *ref_str)
 	if (colon) {
 		len = colon - repo_part;
 		tmp = strndup(repo_part, len);
-		if (!tmp)
-			return -ENOMEM;
+	} else {
+		tmp = strdup(repo_part);
+	}
+	if (!tmp)
+		return -ENOMEM;
 
-		if (!strchr(tmp, '/') &&
-		    (!strcmp(ctx->registry, DOCKER_API_REGISTRY) ||
-		     !strcmp(ctx->registry, DOCKER_REGISTRY))) {
-			char *full_repo;
+	if (!strchr(tmp, '/') &&
+	    (!strcmp(ctx->registry, DOCKER_API_REGISTRY) ||
+	     !strcmp(ctx->registry, DOCKER_REGISTRY))) {
+		char *full_repo;
 
-			if (asprintf(&full_repo, "library/%s", tmp) == -1) {
-				free(tmp);
-				return -ENOMEM;
-			}
+		if (asprintf(&full_repo, "library/%s", tmp) == -1) {
 			free(tmp);
-			tmp = full_repo;
+			return -ENOMEM;
 		}
-		free(ctx->repository);
-		ctx->repository = tmp;
+		free(tmp);
+		tmp = full_repo;
+	}
+	free(ctx->repository);
+	ctx->repository = tmp;
 
+	if (colon) {
 		free(ctx->tag);
 		ctx->tag = strdup(colon + 1);
 		if (!ctx->tag)
 			return -ENOMEM;
-	} else {
-		tmp = strdup(repo_part);
-		if (!tmp)
-			return -ENOMEM;
-
-		if (!strchr(tmp, '/') &&
-		    (!strcmp(ctx->registry, DOCKER_API_REGISTRY) ||
-		     !strcmp(ctx->registry, DOCKER_REGISTRY))) {
-
-			char *full_repo;
-
-			if (asprintf(&full_repo, "library/%s", tmp) == -1) {
-				free(tmp);
-				return -ENOMEM;
-			}
-			free(tmp);
-			tmp = full_repo;
-		}
-		free(ctx->repository);
-		ctx->repository = tmp;
 	}
 	return 0;
 }
 
+const char *ocierofs_get_platform_spec(void)
+{
+#if defined(__linux__)
+#define EROFS_OCI_OS "linux"
+#elif defined(__APPLE__)
+#define EROFS_OCI_OS "darwin"
+#elif defined(_WIN32)
+#define EROFS_OCI_OS "windows"
+#elif defined(__FreeBSD__)
+#define EROFS_OCI_OS "freebsd"
+#else
+#define EROFS_OCI_OS "unknown"
+#endif
+
+#if defined(__x86_64__) || defined(__amd64__)
+	return EROFS_OCI_OS "/amd64";
+#elif defined(__aarch64__) || defined(__arm64__)
+	return EROFS_OCI_OS "/arm64/v8";
+#elif defined(__i386__)
+	return EROFS_OCI_OS "/386";
+#elif defined(__arm__)
+	return EROFS_OCI_OS "/arm/v7";
+#elif defined(__riscv) && (__riscv_xlen == 64)
+	return EROFS_OCI_OS "/riscv64";
+#elif defined(__ppc64__) && defined(__BYTE_ORDER__) && \
+	  (__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__)
+	return EROFS_OCI_OS "/ppc64le";
+#elif defined(__ppc64__)
+	return EROFS_OCI_OS "/ppc64";
+#elif defined(__s390x__)
+	return EROFS_OCI_OS "/s390x";
+#else
+	return NULL;
+#endif
+}
+
 /**
- * ocierofs_init - Initialize OCI context
+ * ocierofs_ctx_init - Initialize OCI context
  * @ctx: OCI context structure to initialize
  * @config: OCI configuration
  *
  * Initialize OCI context structure, set up CURL handle, and configure
- * default parameters including platform (linux/amd64), registry
+ * default parameters including platform (host platform), registry
  * (registry-1.docker.io), and tag (latest).
  *
  * Return: 0 on success, negative errno on failure
  */
-static int ocierofs_init(struct ocierofs_ctx *ctx, const struct ocierofs_config *config)
+int ocierofs_ctx_init(struct ocierofs_ctx *ctx, const struct ocierofs_config *config)
 {
 	int ret;
 
@@ -1131,16 +1173,21 @@ static int ocierofs_init(struct ocierofs_ctx *ctx, const struct ocierofs_config 
 		ctx->blob_digest = NULL;
 	ctx->registry = strdup("registry-1.docker.io");
 	ctx->tag = strdup("latest");
-	if (config->platform)
-		ctx->platform = strdup(config->platform);
-	else
-		ctx->platform = strdup("linux/amd64");
+	ctx->platform = strdup(config->platform ?: ocierofs_get_platform_spec());
 	if (!ctx->registry || !ctx->tag || !ctx->platform)
 		return -ENOMEM;
+
+	ctx->schema = config->insecure ? "http://" : "https://";
 
 	ret = ocierofs_parse_ref(ctx, config->image_ref);
 	if (ret)
 		return ret;
+
+	if (config->insecure && (!strcmp(ctx->registry, DOCKER_API_REGISTRY) ||
+				 !strcmp(ctx->registry, DOCKER_REGISTRY))) {
+		erofs_err("Insecure connection to Docker registry is not allowed");
+		return -EINVAL;
+	}
 
 	ret = ocierofs_prepare_layers(ctx, config);
 	if (ret)
@@ -1166,8 +1213,8 @@ static int ocierofs_download_blob_to_fd(struct ocierofs_ctx *ctx,
 	};
 
 	api_registry = ocierofs_get_api_registry(ctx->registry);
-	if (asprintf(&req.url, "https://%s/v2/%s/blobs/%s",
-	     api_registry, ctx->repository, digest) == -1)
+	if (asprintf(&req.url, "%s%s/v2/%s/blobs/%s",
+	     ctx->schema, api_registry, ctx->repository, digest) == -1)
 		return -ENOMEM;
 
 	if (auth_header && strstr(auth_header, "Bearer"))
@@ -1243,7 +1290,7 @@ out:
  * Clean up CURL handle, free all allocated string parameters, and
  * reset the OCI context structure to a clean state.
  */
-static void ocierofs_ctx_cleanup(struct ocierofs_ctx *ctx)
+void ocierofs_ctx_cleanup(struct ocierofs_ctx *ctx)
 {
 	if (!ctx)
 		return;
@@ -1271,7 +1318,7 @@ int ocierofs_build_trees(struct erofs_importer *importer,
 	int ret, i, end, fd;
 	u64 tar_offset = 0;
 
-	ret = ocierofs_init(&ctx, config);
+	ret = ocierofs_ctx_init(&ctx, config);
 	if (ret) {
 		ocierofs_ctx_cleanup(&ctx);
 		return ret;
@@ -1358,8 +1405,8 @@ static int ocierofs_download_blob_range(struct ocierofs_ctx *ctx, off_t offset, 
 		length = (size_t)(blob_size - offset);
 
 	api_registry = ocierofs_get_api_registry(ctx->registry);
-	if (asprintf(&req.url, "https://%s/v2/%s/blobs/%s",
-	     api_registry, ctx->repository, digest) == -1)
+	if (asprintf(&req.url, "%s%s/v2/%s/blobs/%s",
+	     ctx->schema, api_registry, ctx->repository, digest) == -1)
 		return -ENOMEM;
 
 	if (length)
@@ -1484,17 +1531,19 @@ int ocierofs_io_open(struct erofs_vfile *vfile, const struct ocierofs_config *cf
 	if (!ctx)
 		return -ENOMEM;
 
-	err = ocierofs_init(ctx, cfg);
-	if (err) {
-		free(ctx);
-		return err;
+	err = ocierofs_ctx_init(ctx, cfg);
+	if (err)
+		goto out;
+
+	if (!ctx->blob_digest) {
+		err = -EINVAL;
+		goto out;
 	}
 
 	oci_iostream = calloc(1, sizeof(*oci_iostream));
 	if (!oci_iostream) {
-		ocierofs_ctx_cleanup(ctx);
-		free(ctx);
-		return -ENOMEM;
+		err = -ENOMEM;
+		goto out;
 	}
 
 	oci_iostream->ctx = ctx;
@@ -1502,6 +1551,11 @@ int ocierofs_io_open(struct erofs_vfile *vfile, const struct ocierofs_config *cf
 	*vfile = (struct erofs_vfile){.ops = &ocierofs_io_vfops};
 	*(struct ocierofs_iostream **)vfile->payload = oci_iostream;
 	return 0;
+
+out:
+	ocierofs_ctx_cleanup(ctx);
+	free(ctx);
+	return err;
 }
 
 char *ocierofs_encode_userpass(const char *username, const char *password)
@@ -1573,5 +1627,171 @@ int ocierofs_decode_userpass(const char *b64, char **out_user, char **out_pass)
 int ocierofs_io_open(struct erofs_vfile *vfile, const struct ocierofs_config *cfg)
 {
 	return -EOPNOTSUPP;
+}
+#endif
+
+#if defined(OCIEROFS_ENABLED) && defined(TEST)
+struct ocierofs_parse_ref_testcase {
+	const char *name;
+	const char *ref_str;
+	const char *expected_registry;
+	const char *expected_repository;
+	const char *expected_tag;
+};
+
+static bool run_ocierofs_parse_ref_test(const struct ocierofs_parse_ref_testcase *tc)
+{
+	struct ocierofs_ctx ctx = {};
+	int ret;
+
+	printf("Running test: %s\n", tc->name);
+
+	/* Initialize with default values */
+	ctx.registry = strdup(DOCKER_API_REGISTRY);
+	ctx.tag = strdup("latest");
+	if (!ctx.registry || !ctx.tag) {
+		printf("  FAILED: memory allocation error during setup\n");
+		free(ctx.registry);
+		free(ctx.tag);
+		return false;
+	}
+
+	ret = ocierofs_parse_ref(&ctx, tc->ref_str);
+	if (ret < 0) {
+		printf("  FAILED: ocierofs_parse_ref returned %d\n", ret);
+		goto cleanup;
+	}
+
+	if (tc->expected_registry && strcmp(ctx.registry, tc->expected_registry) != 0) {
+		printf("  FAILED: registry mismatch\n");
+		printf("    Expected: %s\n", tc->expected_registry);
+		printf("    Got:      %s\n", ctx.registry);
+		ret = -EINVAL;
+		goto cleanup;
+	}
+
+	if (tc->expected_repository && strcmp(ctx.repository, tc->expected_repository) != 0) {
+		printf("  FAILED: repository mismatch\n");
+		printf("    Expected: %s\n", tc->expected_repository);
+		printf("    Got:      %s\n", ctx.repository);
+		ret = -EINVAL;
+		goto cleanup;
+	}
+
+	if (tc->expected_tag && strcmp(ctx.tag, tc->expected_tag) != 0) {
+		printf("  FAILED: tag mismatch\n");
+		printf("    Expected: %s\n", tc->expected_tag);
+		printf("    Got:      %s\n", ctx.tag);
+		ret = -EINVAL;
+		goto cleanup;
+	}
+
+	printf("  PASSED\n");
+	printf("    Registry:   %s\n", ctx.registry);
+	printf("    Repository: %s\n", ctx.repository);
+	printf("    Tag:        %s\n", ctx.tag);
+
+cleanup:
+	free(ctx.registry);
+	free(ctx.repository);
+	free(ctx.tag);
+	return ret == 0;
+}
+
+static int test_ocierofs_parse_ref(void)
+{
+	struct ocierofs_parse_ref_testcase tests[] = {
+		{
+			.name = "Simple image name (Docker Hub library)",
+			.ref_str = "nginx",
+			.expected_registry = DOCKER_API_REGISTRY,
+			.expected_repository = "library/nginx",
+			.expected_tag = "latest",
+		},
+		{
+			.name = "Image with tag (Docker Hub library)",
+			.ref_str = "nginx:1.21",
+			.expected_registry = DOCKER_API_REGISTRY,
+			.expected_repository = "library/nginx",
+			.expected_tag = "1.21",
+		},
+		{
+			.name = "User repository without tag",
+			.ref_str = "user/myapp",
+			.expected_registry = DOCKER_API_REGISTRY,
+			.expected_repository = "user/myapp",
+			.expected_tag = "latest",
+		},
+		{
+			.name = "User repository with tag",
+			.ref_str = "user/myapp:v2.0",
+			.expected_registry = DOCKER_API_REGISTRY,
+			.expected_repository = "user/myapp",
+			.expected_tag = "v2.0",
+		},
+		{
+			.name = "Custom registry without tag",
+			.ref_str = "registry.example.com/myapp",
+			.expected_registry = "registry.example.com",
+			.expected_repository = "myapp",
+			.expected_tag = "latest",
+		},
+		{
+			.name = "Custom registry with tag",
+			.ref_str = "registry.example.com/myapp:v1.0",
+			.expected_registry = "registry.example.com",
+			.expected_repository = "myapp",
+			.expected_tag = "v1.0",
+		},
+		{
+			.name = "Custom registry with port",
+			.ref_str = "localhost:5000/myapp:latest",
+			.expected_registry = "localhost:5000",
+			.expected_repository = "myapp",
+			.expected_tag = "latest",
+		},
+		{
+			.name = "Custom registry with ip & port",
+			.ref_str = "127.0.0.1:5000/myapp:latest",
+			.expected_registry = "127.0.0.1:5000",
+			.expected_repository = "myapp",
+			.expected_tag = "latest",
+		},
+		{
+			.name = "Custom registry with nested repository",
+			.ref_str = "registry.example.com/org/project/app:dev",
+			.expected_registry = "registry.example.com",
+			.expected_repository = "org/project/app",
+			.expected_tag = "dev",
+		},
+		{
+			.name = "Tag with digest-like format",
+			.ref_str = "myapp:sha256-abc123",
+			.expected_registry = DOCKER_API_REGISTRY,
+			.expected_repository = "library/myapp",
+			.expected_tag = "sha256-abc123",
+		},
+		{
+			.name = "Multi-level path without registry",
+			.ref_str = "org/team/app:v1",
+			.expected_registry = DOCKER_API_REGISTRY,
+			.expected_repository = "org/team/app",
+			.expected_tag = "v1",
+		},
+	};
+	int i, pass = 0;
+
+	for (i = 0; i < ARRAY_SIZE(tests); ++i) {
+		pass += run_ocierofs_parse_ref_test(&tests[i]);
+		putc('\n', stdout);
+	}
+
+	printf("Run all %d tests with %d PASSED\n", i, pass);
+	return ARRAY_SIZE(tests) == pass;
+}
+
+int main(int argc, char *argv[])
+{
+	exit(test_ocierofs_parse_ref() ? EXIT_SUCCESS : EXIT_FAILURE);
 }
 #endif

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0+ OR Apache-2.0
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
 /*
  * Copyright (C) 2025 Alibaba Cloud
  */
@@ -82,6 +82,7 @@ long erofs_nbd_in_service(int nbdnum)
 		return err;
 	}
 	close(fd);
+	s[sizeof(s) - 1] = '\0';
 	return strtol(s, NULL, 10);
 }
 
@@ -321,7 +322,7 @@ static int erofs_nbd_nl_cfg_cb(struct nl_msg *msg, void *arg)
 		ctx->errcode = -EBADMSG;
 	}
 	*ctx->index = nla_get_u32(msg_attr[NBD_ATTR_INDEX]);
-	erofs_dbg("Connected /dev/nbd%d\n", *ctx->index);
+	erofs_dbg("Connected /dev/nbd%d", *ctx->index);
 	ctx->errcode = 0;
 	return NL_OK;
 }
@@ -515,6 +516,39 @@ err_nls_free:
 	nl_socket_free(socket);
 	return err;
 }
+
+int erofs_nbd_nl_disconnect(int index)
+{
+	struct nl_sock *socket;
+	struct nl_msg *msg;
+	int driver_id, err;
+
+	socket= erofs_nbd_get_nl_sock(&driver_id);
+	if (IS_ERR(socket))
+		return PTR_ERR(socket);
+	msg = nlmsg_alloc();
+	if (!msg) {
+		erofs_err("Couldn't allocate netlink message");
+		err = -ENOMEM;
+		goto err_nls_free;
+	}
+
+	err = -EINVAL;
+	genlmsg_put(msg, NL_AUTO_PORT, NL_AUTO_SEQ, driver_id, 0, 0,
+		    NBD_CMD_DISCONNECT, 0);
+	NLA_PUT_U32(msg, NBD_ATTR_INDEX, index);
+	err = nl_send_sync(socket, msg);
+	if (err < 0)
+		erofs_err("Failed to disconnect device %d, check dmesg", err);
+	nl_socket_free(socket);
+	return err;
+nla_put_failure:
+	erofs_err("Failed to create netlink message");
+	nlmsg_free(msg);
+err_nls_free:
+	nl_socket_free(socket);
+	return err;
+}
 #else
 int erofs_nbd_nl_connect(int *index, int blkbits, u64 blocks,
 			 const char *identifier)
@@ -529,6 +563,10 @@ int erofs_nbd_nl_reconnect(int index, const char *identifier)
 
 int erofs_nbd_nl_reconfigure(int index, const char *identifier,
 			     bool autoclear)
+{
+	return -EOPNOTSUPP;
+}
+int erofs_nbd_nl_disconnect(int index)
 {
 	return -EOPNOTSUPP;
 }

@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: GPL-2.0+ OR Apache-2.0 */
+/* SPDX-License-Identifier: GPL-2.0+ OR MIT */
 /*
  * Copyright (C) 2018 HUAWEI, Inc.
  *             http://www.huawei.com
@@ -30,7 +30,7 @@ struct erofs_buffer_block;
 #define DEVT		5
 
 struct erofs_bhops {
-	int (*flush)(struct erofs_buffer_head *bh);
+	int (*flush)(struct erofs_buffer_head *bh, bool abort);
 };
 
 struct erofs_buffer_head {

@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: GPL-2.0+ OR Apache-2.0 */
+/* SPDX-License-Identifier: GPL-2.0+ OR MIT */
 /*
  * Copyright (C) 2025 Alibaba Cloud
  */
@@ -29,7 +29,10 @@ enum {
 	EROFS_FRAGDEDUPE_OFF,
 };
 
+#define EROFS_COMPRESSED_EXTENT_UNSPECIFIED	0
+
 struct erofs_importer_params {
+	struct z_erofs_paramset *z_paramsets;
 	char *source;
 	u32 mt_async_queue_limit;
 	u32 fixed_uid;
@@ -41,17 +44,19 @@ struct erofs_importer_params {
 	u32 pclusterblks_def;
 	u32 pclusterblks_packed;
 	s32 pclusterblks_metabox;
+	s32 max_compressed_extent_size;
+	s64 build_time;
 	char force_inodeversion;
 	bool ignore_mtime;
 	bool no_datainline;
 	/* Issue directory data (except inline data) separately from regular inodes */
 	bool grouped_dirdata;
+	bool dirdata_in_metazone;
 	bool hard_dereference;
 	bool ovlfs_strip;
 	bool dot_omitted;
 	bool no_xattrs;			/* don't store extended attributes */
 	bool no_zcompact;
-	bool no_lz4_0padding;
 	bool ztailpacking;
 	char dedupe;
 	bool fragments;
