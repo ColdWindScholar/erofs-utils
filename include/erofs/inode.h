@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: GPL-2.0+ OR Apache-2.0 */
+/* SPDX-License-Identifier: GPL-2.0+ OR MIT */
 /*
  * Copyright (C) 2018-2019 HUAWEI, Inc.
  *             http://www.huawei.com/
@@ -38,7 +38,8 @@ erofs_nid_t erofs_lookupnid(struct erofs_inode *inode);
 int erofs_iflush(struct erofs_inode *inode);
 struct erofs_dentry *erofs_d_alloc(struct erofs_inode *parent,
 				   const char *name);
-int erofs_allocate_inode_bh_data(struct erofs_inode *inode, erofs_blk_t nblocks);
+int erofs_allocate_inode_bh_data(struct erofs_inode *inode, erofs_blk_t nblocks,
+				 bool in_metazone);
 bool erofs_dentry_is_wht(struct erofs_sb_info *sbi, struct erofs_dentry *d);
 int __erofs_fill_inode(struct erofs_importer *im, struct erofs_inode *inode,
 		       struct stat *st, const char *path);
@@ -48,7 +49,8 @@ int erofs_importer_load_tree(struct erofs_importer *im, bool rebuild,
 struct erofs_inode *erofs_mkfs_build_special_from_fd(struct erofs_importer *im,
 						     int fd, const char *name);
 int erofs_fixup_root_inode(struct erofs_inode *root);
-struct erofs_inode *erofs_rebuild_make_root(struct erofs_sb_info *sbi);
+struct erofs_inode *erofs_make_empty_root_inode(struct erofs_importer *im,
+						struct erofs_sb_info *sbi);
 
 #ifdef __cplusplus
 }

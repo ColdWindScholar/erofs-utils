@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: GPL-2.0+ OR Apache-2.0 */
+/* SPDX-License-Identifier: GPL-2.0+ OR MIT */
 /*
  * Copyright (C) 2019 HUAWEI, Inc.
  *             http://www.huawei.com/
@@ -25,6 +25,8 @@ typedef unsigned short umode_t;
 #ifdef HAVE_PTHREAD_H
 #include <pthread.h>
 #endif
+#include <stdlib.h>
+#include <string.h>
 #include "atomic.h"
 #include "io.h"
 
@@ -130,6 +132,7 @@ struct erofs_sb_info {
 
 	u32 xattr_prefix_start;
 	u8 xattr_prefix_count;
+	u8 ishare_xattr_prefix_id;
 	struct erofs_xattr_prefix_item *xattr_prefixes;
 
 	struct erofs_vfile bdev;
@@ -156,6 +159,7 @@ struct erofs_sb_info {
 	struct erofs_buffer_head *bh_devt;
 	bool useqpl;
 	bool sb_valid;
+	u32 metazone_startblk;
 };
 
 /* make sure that any user of the erofs headers has atleast 64bit off_t type */
@@ -175,7 +179,7 @@ static inline void erofs_sb_clear_##name(struct erofs_sb_info *sbi) \
 	sbi->feature_##compat &= ~EROFS_FEATURE_##feature; \
 }
 
-EROFS_FEATURE_FUNCS(lz4_0padding, incompat, INCOMPAT_ZERO_PADDING)
+EROFS_FEATURE_FUNCS(lz4_0padding, incompat, INCOMPAT_LZ4_0PADDING)
 EROFS_FEATURE_FUNCS(compr_cfgs, incompat, INCOMPAT_COMPR_CFGS)
 EROFS_FEATURE_FUNCS(big_pcluster, incompat, INCOMPAT_BIG_PCLUSTER)
 EROFS_FEATURE_FUNCS(chunked_file, incompat, INCOMPAT_CHUNKED_FILE)
@@ -188,7 +192,9 @@ EROFS_FEATURE_FUNCS(48bit, incompat, INCOMPAT_48BIT)
 EROFS_FEATURE_FUNCS(metabox, incompat, INCOMPAT_METABOX)
 EROFS_FEATURE_FUNCS(sb_chksum, compat, COMPAT_SB_CHKSUM)
 EROFS_FEATURE_FUNCS(xattr_filter, compat, COMPAT_XATTR_FILTER)
+EROFS_FEATURE_FUNCS(shared_ea_in_metabox, compat, COMPAT_SHARED_EA_IN_METABOX)
 EROFS_FEATURE_FUNCS(plain_xattr_pfx, compat, COMPAT_PLAIN_XATTR_PFX)
+EROFS_FEATURE_FUNCS(ishare_xattrs, compat, COMPAT_ISHARE_XATTRS)
 
 #define EROFS_I_EA_INITED_BIT	0
 #define EROFS_I_Z_INITED_BIT	1
@@ -202,6 +208,15 @@ struct erofs_diskbuf;
 #define EROFS_INODE_DATA_SOURCE_LOCALPATH	1
 #define EROFS_INODE_DATA_SOURCE_DISKBUF		2
 #define EROFS_INODE_DATA_SOURCE_RESVSP		3
+#define EROFS_INODE_DATA_SOURCE_REBUILD_BLOB	4
+
+enum erofs_idata_type {
+	EROFS_IDATA_TYPE_RAW,
+	EROFS_IDATA_TYPE_COMPRESSED_DEFAULT,
+	EROFS_IDATA_TYPE_COMPRESSED_END_OF_2B,
+};
+
+#define EROFS_I_BLKADDR_DEV_ID_BIT		48
 
 struct erofs_inode {
 	struct list_head i_hash, i_subdirs, i_xattrs;
@@ -245,13 +260,15 @@ struct erofs_inode {
 		char *i_link;
 		struct erofs_diskbuf *i_diskbuf;
 	};
+	char *rebuild_blobpath;
+	erofs_off_t rebuild_src_dataoff;
 	unsigned char datalayout;
 	unsigned char inode_isize;
 	/* inline tail-end packing size */
 	unsigned short idata_size;
 	char datasource;
 	bool in_metabox;
-	bool compressed_idata;
+	char idata_type;
 	bool lazy_tailblock;
 	bool opaque;
 	/* OVL: non-merge dir that may contain whiteout entries */
@@ -304,6 +321,11 @@ struct erofs_inode {
 static inline bool erofs_inode_in_metabox(struct erofs_inode *inode)
 {
 	return inode->nid >> EROFS_DIRENT_NID_METABOX_BIT;
+}
+
+static inline erofs_blk_t erofs_inode_dev_baddr(struct erofs_inode *inode)
+{
+	return inode->u.i_blkaddr & (BIT_ULL(EROFS_I_BLKADDR_DEV_ID_BIT) - 1);
 }
 
 static inline erofs_off_t erofs_iloc(struct erofs_inode *inode)
@@ -422,6 +444,13 @@ struct erofs_map_dev {
 	unsigned int m_deviceid;
 };
 
+struct z_erofs_paramset {
+	char *alg;
+	int clevel;
+	u32 dict_size;
+	char *extraopts;
+};
+
 int liberofs_global_init(void);
 void liberofs_global_exit(void);
 
@@ -530,6 +559,14 @@ static inline int erofs_blk_read(struct erofs_sb_info *sbi, int device_id,
 {
 	return erofs_dev_read(sbi, device_id, buf, erofs_pos(sbi, start),
 			      erofs_pos(sbi, nblocks));
+}
+
+static inline void erofs_free_sensitive(void *ptr, size_t len)
+{
+	if (!ptr)
+		return;
+	memset(ptr, 0, len);
+	free(ptr);
 }
 
 /* vmdk.c */

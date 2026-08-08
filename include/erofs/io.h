@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: GPL-2.0+ OR Apache-2.0 */
+/* SPDX-License-Identifier: GPL-2.0+ OR MIT */
 /*
  * Copyright (C) 2018-2019 HUAWEI, Inc.
  *             http://www.huawei.com/
@@ -26,6 +26,17 @@ extern "C"
 
 #ifndef O_BINARY
 #define O_BINARY	0
+#endif
+
+/*
+ * seek stuff
+ */
+#ifndef SEEK_DATA
+#define SEEK_DATA	3
+#endif
+
+#ifndef SEEK_HOLE
+#define SEEK_HOLE	4
 #endif
 
 struct erofs_vfile;

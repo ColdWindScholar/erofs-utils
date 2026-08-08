@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: GPL-2.0+ OR Apache-2.0 */
+/* SPDX-License-Identifier: GPL-2.0+ OR MIT */
 /*
  * Copyright (C) 2025 Tencent, Inc.
  *             http://www.tencent.com/
@@ -23,6 +23,7 @@ struct erofs_importer;
  * @password: password for authentication (optional)
  * @blob_digest: specific blob digest to extract (NULL for all layers)
  * @layer_index: specific layer index to extract (negative for all layers)
+ * @insecure: use HTTP for registry communication (optional)
  *
  * Configuration structure for OCI image parameters including registry
  * location, image identification, platform specification, and authentication
@@ -37,6 +38,7 @@ struct ocierofs_config {
 	int layer_index;
 	char *tarindex_path;
 	char *zinfo_path;
+	bool insecure;
 };
 
 struct ocierofs_layer_info {
@@ -57,6 +59,7 @@ struct ocierofs_ctx {
 	struct ocierofs_layer_info **layers;
 	char *blob_digest;
 	int layer_count;
+	const char *schema;
 };
 
 struct ocierofs_iostream {
@@ -73,10 +76,14 @@ struct ocierofs_iostream {
  */
 int ocierofs_build_trees(struct erofs_importer *importer,
 			 const struct ocierofs_config *cfg);
+int ocierofs_ctx_init(struct ocierofs_ctx *ctx,
+		      const struct ocierofs_config *cfg);
+void ocierofs_ctx_cleanup(struct ocierofs_ctx *ctx);
 int ocierofs_io_open(struct erofs_vfile *vf, const struct ocierofs_config *cfg);
 
 char *ocierofs_encode_userpass(const char *username, const char *password);
 int ocierofs_decode_userpass(const char *b64, char **out_user, char **out_pass);
+const char *ocierofs_get_platform_spec(void);
 
 #ifdef __cplusplus
 }

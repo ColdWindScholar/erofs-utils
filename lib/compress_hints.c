@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0+ OR Apache-2.0
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
 /*
  * Copyright (C), 2008-2021, OPPO Mobile Comm Corp., Ltd.
  * Created by Huang Jianan <huangjianan@oppo.com>
@@ -129,7 +129,7 @@ int erofs_load_compress_hints(struct erofs_importer *im,
 		} else {
 			ccfg = atoi(alg);
 			if (ccfg >= EROFS_MAX_COMPR_CFGS ||
-			    !cfg.c_compr_opts[ccfg].alg) {
+			    !params->z_paramsets[ccfg].alg) {
 				erofs_err("invalid compressing configuration \"%s\" at line %u",
 					  alg, line);
 				ret = -EINVAL;

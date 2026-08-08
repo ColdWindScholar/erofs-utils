@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: GPL-2.0+ OR Apache-2.0 */
+/* SPDX-License-Identifier: GPL-2.0+ OR MIT */
 /*
  * Copyright (C) 2018-2019 HUAWEI, Inc.
  *             http://www.huawei.com/
@@ -17,12 +17,14 @@ struct erofs_compressor {
 	u32 default_dictsize;
 	u32 max_dictsize;
 
-	int (*init)(struct erofs_compress *c);
+	int (*preinit)(struct erofs_compress *c);
 	int (*exit)(struct erofs_compress *c);
 	void (*reset)(struct erofs_compress *c);
 	int (*setlevel)(struct erofs_compress *c, int compression_level);
 	int (*setdictsize)(struct erofs_compress *c, u32 dict_size,
 			   u32 pclustersize_max);
+	int (*setextraopts)(struct erofs_compress *c, const char *extraopts);
+	int (*init)(struct erofs_compress *c);
 
 	int (*compress_destsize)(const struct erofs_compress *c,
 				 const void *src, unsigned int *srcsize,
@@ -69,7 +71,7 @@ int erofs_compress(const struct erofs_compress *c,
 		   void *dst, unsigned int dstcapacity);
 
 int erofs_compressor_init(struct erofs_sb_info *sbi, struct erofs_compress *c,
-			  char *alg_name, int compression_level, u32 dict_size,
+			  const struct z_erofs_paramset *zset,
 			  u32 pclustersize_max);
 int erofs_compressor_exit(struct erofs_compress *c);
 void erofs_compressor_reset(struct erofs_compress *c);

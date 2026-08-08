@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0+ OR Apache-2.0
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
 #include "erofs/internal.h"
 #include "erofs/print.h"
 #include "erofs/config.h"
@@ -123,10 +123,10 @@ static int erofs_compressor_libzstd_setdictsize(struct erofs_compress *c,
 		} else {
 			dict_size = min_t(u32, Z_EROFS_ZSTD_MAX_DICT_SIZE,
 					  pclustersize_max << 3);
-			dict_size = 1 << ilog2(dict_size);
+			dict_size = 1U << ilog2(dict_size);
 		}
 	}
-	if (dict_size != 1 << ilog2(dict_size) ||
+	if (dict_size != 1U << ilog2(dict_size) ||
 	    dict_size > Z_EROFS_ZSTD_MAX_DICT_SIZE) {
 		erofs_err("invalid dictionary size %u", dict_size);
 		return -EINVAL;
@@ -175,8 +175,7 @@ static int compressor_libzstd_init(struct erofs_compress *c)
 
 	if (!erofs_atomic_test_and_set(&__warnonce)) {
 		erofs_warn("EXPERIMENTAL libzstd compressor in use. Note that `fitblk` isn't supported by upstream zstd for now.");
-		erofs_warn("Therefore it will takes more time in order to get the optimal result.");
-		erofs_info("You could clarify further needs in zstd repository <https://github.com/facebook/zstd/issues> for reference too.");
+		erofs_warn("If unaligned compression isn't used (without -E48bit), it will take more time in order to get the optimal result.");
 	}
 	return 0;
 out_err:

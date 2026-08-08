@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0+ OR Apache-2.0
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
 /*
  * Copyright (C) 2018-2019 HUAWEI, Inc.
  *             http://www.huawei.com/
@@ -10,7 +10,8 @@
 #include "erofs/print.h"
 #include "liberofs_cache.h"
 
-static int erofs_bh_flush_drop_directly(struct erofs_buffer_head *bh)
+static int erofs_bh_flush_drop_directly(struct erofs_buffer_head *bh,
+					bool abort)
 {
 	return erofs_bh_flush_generic_end(bh);
 }
@@ -19,7 +20,7 @@ const struct erofs_bhops erofs_drop_directly_bhops = {
 	.flush = erofs_bh_flush_drop_directly,
 };
 
-static int erofs_bh_flush_skip_write(struct erofs_buffer_head *bh)
+static int erofs_bh_flush_skip_write(struct erofs_buffer_head *bh, bool abort)
 {
 	return -EBUSY;
 }
@@ -448,8 +449,8 @@ static void erofs_bfree(struct erofs_buffer_block *bb)
 	free(bb);
 }
 
-int erofs_bflush(struct erofs_bufmgr *bmgr,
-		 struct erofs_buffer_block *bb)
+static int __erofs_bflush(struct erofs_bufmgr *bmgr,
+			  struct erofs_buffer_block *bb, bool abort)
 {
 	struct erofs_sb_info *sbi = bmgr->sbi;
 	const unsigned int blksiz = erofs_blksiz(sbi);
@@ -470,12 +471,19 @@ int erofs_bflush(struct erofs_bufmgr *bmgr,
 
 		list_for_each_entry_safe(bh, nbh, &p->buffers.list, list) {
 			if (bh->op == &erofs_skip_write_bhops) {
-				skip = true;
-				continue;
+				if (!abort) {
+					skip = true;
+					continue;
+				}
+				bh->op = &erofs_drop_directly_bhops;
 			}
 
 			/* flush and remove bh */
-			ret = bh->op->flush(bh);
+			ret = bh->op->flush(bh, abort);
+			if (__erofs_unlikely(ret == -EBUSY && !abort)) {
+				skip = true;
+				continue;
+			}
 			if (ret < 0)
 				return ret;
 		}
@@ -499,6 +507,11 @@ int erofs_bflush(struct erofs_bufmgr *bmgr,
 		erofs_bfree(p);
 	}
 	return 0;
+}
+
+int erofs_bflush(struct erofs_bufmgr *bmgr, struct erofs_buffer_block *bb)
+{
+	return __erofs_bflush(bmgr, bb, false);
 }
 
 void erofs_bdrop(struct erofs_buffer_head *bh, bool tryrevoke)
@@ -533,6 +546,7 @@ erofs_blk_t erofs_total_metablocks(struct erofs_bufmgr *bmgr)
 
 void erofs_buffer_exit(struct erofs_bufmgr *bmgr)
 {
+	DBG_BUGON(__erofs_bflush(bmgr, NULL, true));
 	DBG_BUGON(!list_empty(&bmgr->blkh.list));
 	free(bmgr);
 }

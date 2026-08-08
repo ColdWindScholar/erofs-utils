@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0+ OR Apache-2.0
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
 /*
  * Copyright (C) 2025 Alibaba Cloud
  */
@@ -23,6 +23,9 @@ void erofs_importer_preset(struct erofs_importer_params *params)
 		.fixed_uid = -1,
 		.fixed_gid = -1,
 		.fsalignblks = 1,
+		.build_time = -1,
+		.max_compressed_extent_size =
+			EROFS_COMPRESSED_EXTENT_UNSPECIFIED,
 	};
 }
 
@@ -83,6 +86,16 @@ int erofs_importer_init(struct erofs_importer *im)
 
 	if (params->dot_omitted)
 		erofs_sb_set_48bit(sbi);
+
+	if (params->build_time != -1) {
+		if (erofs_sb_has_48bit(sbi)) {
+			sbi->epoch = max_t(s64, 0, params->build_time - UINT32_MAX);
+			sbi->build_time = params->build_time - sbi->epoch;
+		} else {
+			sbi->epoch = params->build_time;
+		}
+	}
+
 	return 0;
 
 out_err:
