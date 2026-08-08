@@ -7,11 +7,11 @@ on:
       release:
         description: 'Push a new release'
         required: false
-        default: 'false'
+        default: 'true'
       version:
         description: 'Version'
         required: false
-        default: 'v1.8.10-25101900'
+        default: 'v1.9.3-26080800'
 
 jobs:
   release:
