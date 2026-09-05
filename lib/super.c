@@ -7,6 +7,7 @@
 #include "erofs/print.h"
 #include "erofs/xattr.h"
 #include "liberofs_cache.h"
+#include "liberofs_chunk.h"
 #include "liberofs_compress.h"
 #include "liberofs_metabox.h"
 
@@ -33,7 +34,7 @@ static int erofs_init_devices(struct erofs_sb_info *sbi,
 	erofs_off_t pos;
 	bool _48bit = erofs_sb_has_48bit(sbi);
 
-	sbi->total_blocks = sbi->primarydevice_blocks;
+	sbi->total_blocks = sbi->dif0.blocks;
 
 	if (!erofs_sb_has_device_table(sbi))
 		ondisk_extradevs = 0;
@@ -118,14 +119,14 @@ int erofs_read_superblock(struct erofs_sb_info *sbi)
 		erofs_err("invalid sb_extslots %u", dsb->sb_extslots);
 		return -EINVAL;
 	}
-	sbi->primarydevice_blocks = le32_to_cpu(dsb->blocks_lo);
+	sbi->dif0.blocks = le32_to_cpu(dsb->blocks_lo);
 	sbi->meta_blkaddr = le32_to_cpu(dsb->meta_blkaddr);
 	sbi->xattr_blkaddr = le32_to_cpu(dsb->xattr_blkaddr);
 	sbi->xattr_prefix_start = le32_to_cpu(dsb->xattr_prefix_start);
 	sbi->xattr_prefix_count = dsb->xattr_prefix_count;
 	if (erofs_sb_has_48bit(sbi) && dsb->rootnid_8b) {
 		sbi->root_nid = le64_to_cpu(dsb->rootnid_8b);
-		sbi->primarydevice_blocks = sbi->primarydevice_blocks |
+		sbi->dif0.blocks = sbi->dif0.blocks |
 				((u64)le16_to_cpu(dsb->rb.blocks_hi) << 32);
 	} else {
 		sbi->root_nid = le16_to_cpu(dsb->rb.rootnid_2b);
@@ -185,12 +186,23 @@ int erofs_read_superblock(struct erofs_sb_info *sbi)
 
 void erofs_put_super(struct erofs_sb_info *sbi)
 {
+	erofs_chunkmgr_exit(sbi);
 	if (sbi->devs) {
 		int i;
 
 		DBG_BUGON(!sbi->extra_devices);
-		for (i = 0; i < sbi->extra_devices; ++i)
+		for (i = 0; i < sbi->extra_devices; ++i) {
+			struct erofs_bufmgr *bmgr = sbi->devs[i].bmgr;
+			struct erofs_vfile *vf;
+
+			if (bmgr) {
+				vf = bmgr->vf;
+				erofs_buffer_exit(bmgr);
+				close(vf->fd);
+				free(vf);
+			}
 			free(sbi->devs[i].src_path);
+		}
 		free(sbi->devs);
 		sbi->devs = NULL;
 	}
@@ -212,7 +224,7 @@ int erofs_writesb(struct erofs_sb_info *sbi)
 		.rb.rootnid_2b  = cpu_to_le16(sbi->root_nid),
 		.inos      = cpu_to_le64(sbi->inos),
 		.epoch     = cpu_to_le64(sbi->epoch),
-		.build_time = cpu_to_le64(sbi->build_time),
+		.build_time = cpu_to_le32(sbi->build_time),
 		.fixed_nsec = cpu_to_le32(sbi->fixed_nsec),
 		.meta_blkaddr  = cpu_to_le32(sbi->meta_blkaddr),
 		.xattr_blkaddr = cpu_to_le32(sbi->xattr_blkaddr),
@@ -230,10 +242,10 @@ int erofs_writesb(struct erofs_sb_info *sbi)
 	char *buf;
 	int ret;
 
-	sb.blocks_lo	= cpu_to_le32(sbi->primarydevice_blocks);
-	if (sbi->primarydevice_blocks > UINT32_MAX ||
+	sb.blocks_lo	= cpu_to_le32(sbi->dif0.blocks);
+	if (sbi->dif0.blocks > UINT32_MAX ||
 	    sbi->root_nid > UINT16_MAX) {
-		sb.rb.blocks_hi = cpu_to_le16(sbi->primarydevice_blocks >> 32);
+		sb.rb.blocks_hi = cpu_to_le16(sbi->dif0.blocks >> 32);
 		sb.rootnid_8b = cpu_to_le64(sbi->root_nid);
 	}
 	memcpy(sb.uuid, sbi->uuid, sizeof(sb.uuid));
@@ -404,7 +416,7 @@ int erofs_mkfs_init_devices(struct erofs_sb_info *sbi, unsigned int devices)
 
 int erofs_write_device_table(struct erofs_sb_info *sbi)
 {
-	erofs_blk_t nblocks = sbi->primarydevice_blocks;
+	erofs_blk_t nblocks = sbi->dif0.blocks;
 	struct erofs_buffer_head *bh = sbi->bh_devt;
 	erofs_off_t pos;
 	unsigned int i, ret;
@@ -484,7 +496,7 @@ int erofs_mkfs_load_fs(struct erofs_sb_info *sbi, unsigned int dsunit)
 	erofs_warn("EXPERIMENTAL incremental build in use. Use at your own risk!");
 	err = erofs_read_superblock(sbi);
 	if (err) {
-		erofs_err("failed to read superblock of %s: %s", sbi->devname,
+		erofs_err("failed to read superblock of %s: %s", sbi->dif0.src_path,
 			  erofs_strerror(err));
 		return err;
 	}
@@ -493,7 +505,7 @@ int erofs_mkfs_load_fs(struct erofs_sb_info *sbi, unsigned int dsunit)
 	if (!err && S_ISREG(u.st.st_mode))
 		u.startblk = DIV_ROUND_UP(u.st.st_size, erofs_blksiz(sbi));
 	else
-		u.startblk = sbi->primarydevice_blocks;
+		u.startblk = sbi->dif0.blocks;
 
 	bmgr = erofs_buffer_init(sbi, u.startblk, NULL);
 	if (!bmgr)

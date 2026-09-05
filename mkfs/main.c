@@ -24,8 +24,8 @@
 #include "erofs/exclude.h"
 #include "erofs/block_list.h"
 #include "erofs/compress_hints.h"
-#include "erofs/blobchunk.h"
 #include "../lib/compressor.h"
+#include "../lib/liberofs_chunk.h"
 #include "../lib/liberofs_gzran.h"
 #include "../lib/liberofs_metabox.h"
 #include "../lib/liberofs_oci.h"
@@ -1685,12 +1685,12 @@ static int erofs_mkfs_rebuild_load_trees(struct erofs_inode *root)
 		ret = erofs_rebuild_load_tree(root, src, datamode);
 		src->xamgr = NULL;
 		if (ret) {
-			erofs_err("failed to load %s", src->devname);
+			erofs_err("failed to load %s", src->dif0.src_path);
 			return ret;
 		}
 		if (src->extra_devices > 1) {
 			erofs_err("%s: unsupported number %u of extra devices",
-				  src->devname, src->extra_devices);
+				  src->dif0.src_path, src->extra_devices);
 			return -EOPNOTSUPP;
 		}
 		extra_devices += src->extra_devices;
@@ -1723,8 +1723,8 @@ static int erofs_mkfs_rebuild_load_trees(struct erofs_inode *root)
 			nblocks = src->devs[0].blocks;
 			tag = src->devs[0].tag;
 		} else {
-			nblocks = src->primarydevice_blocks;
-			devs[idx].src_path = strdup(src->devname);
+			nblocks = src->dif0.blocks;
+			devs[idx].src_path = strdup(src->dif0.src_path);
 		}
 		devs[idx].blocks = nblocks;
 		if (tag && *tag)
@@ -1849,7 +1849,7 @@ int main(int argc, char **argv)
 			goto exit;
 		err = erofs_read_superblock(src);
 		if (err) {
-			erofs_err("failed to read superblock of %s", src->devname);
+			erofs_err("failed to read superblock of %s", src->dif0.src_path);
 			goto exit;
 		}
 		mkfs_blkszbits = src->blkszbits;
@@ -1915,12 +1915,6 @@ int main(int argc, char **argv)
 	}
 
 	cfg.c_dedupe = importer_params.dedupe;
-	if (cfg.c_chunkbits) {
-		err = erofs_blob_init(cfg.c_blobdev_path, 1 << cfg.c_chunkbits);
-		if (err)
-			goto exit;
-	}
-
 	if (tar_index_512b || cfg.c_blobdev_path) {
 		err = erofs_mkfs_init_devices(&g_sbi, 1);
 		if (err) {
@@ -1928,6 +1922,24 @@ int main(int argc, char **argv)
 				  erofs_strerror(err));
 			goto exit;
 		}
+	}
+
+	if (tar_index_512b || cfg.c_chunkbits) {
+		if (g_sbi.extra_devices && cfg.c_blobdev_path) {
+			g_sbi.devs[0].src_path = strdup(cfg.c_blobdev_path);
+			if (!g_sbi.devs[0].src_path) {
+				err = -ENOMEM;
+				goto exit;
+			}
+
+			err = erofs_blob_init_device(&g_sbi, 1);
+			if (err)
+				goto exit;
+
+		}
+		err = erofs_blob_init(&g_sbi, cfg.c_blobdev_path ? 1 : 0, cfg.c_chunkbits);
+		if (err)
+			goto exit;
 	}
 
 	if (source_mode == EROFS_MKFS_SOURCE_LOCALDIR) {
@@ -2051,7 +2063,7 @@ int main(int argc, char **argv)
 	if (err)
 		goto exit;
 
-	err = erofs_dev_resize(&g_sbi, g_sbi.primarydevice_blocks);
+	err = erofs_dev_resize(&g_sbi, g_sbi.dif0.blocks);
 
 	if (!err && erofs_sb_has_sb_chksum(&g_sbi)) {
 		err = erofs_enable_sb_chksum(&g_sbi, &crc);
@@ -2072,8 +2084,6 @@ exit:
 		fclose(blklst);
 	erofs_cleanup_compress_hints();
 	erofs_cleanup_exclude_rules();
-	if (cfg.c_chunkbits || source_mode == EROFS_MKFS_SOURCE_REBUILD)
-		erofs_blob_exit();
 	erofs_xattr_cleanup_name_prefixes();
 	erofs_rebuild_cleanup();
 	erofs_diskbuf_exit();

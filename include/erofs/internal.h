@@ -67,8 +67,9 @@ struct erofs_buffer_head;
 struct erofs_bufmgr;
 
 struct erofs_device_info {
-	char *src_path;
 	u8 tag[64];
+	char *src_path;
+	struct erofs_bufmgr *bmgr;
 	erofs_blk_t blocks;
 	erofs_blk_t uniaddr;
 };
@@ -89,15 +90,14 @@ struct erofs_mkfs_dfops;
 struct erofs_packed_inode;
 struct erofs_xattrmgr;
 struct z_erofs_mgr;
-struct erofs_metaboxmgr;
+struct erofs_metamgr;
+struct erofs_chunkmgr;
 
 struct erofs_sb_info {
 	struct erofs_sb_lz4_info lz4;
-	struct erofs_device_info *devs;
-	char *devname;
+	struct erofs_device_info *devs, dif0;
 
 	u64 total_blocks;
-	u64 primarydevice_blocks;
 
 	s32 meta_blkaddr;
 	u32 xattr_blkaddr;
@@ -153,6 +153,7 @@ struct erofs_sb_info {
 	struct erofs_bufmgr *bmgr;
 	struct erofs_xattrmgr *xamgr;
 	struct z_erofs_mgr *zmgr;
+	struct erofs_chunkmgr *chunkmgr;
 	struct erofs_metamgr *m2gr, *mxgr;
 	struct erofs_packed_inode *packedinode;
 	struct erofs_buffer_head *bh_sb;

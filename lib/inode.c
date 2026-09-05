@@ -23,9 +23,9 @@
 #include "erofs/exclude.h"
 #include "erofs/block_list.h"
 #include "erofs/compress_hints.h"
-#include "erofs/blobchunk.h"
 #include "erofs/importer.h"
 #include "liberofs_cache.h"
+#include "liberofs_chunk.h"
 #include "liberofs_compress.h"
 #include "liberofs_fragments.h"
 #include "liberofs_metabox.h"
@@ -851,7 +851,7 @@ int erofs_iflush(struct erofs_inode *inode)
 
 		u.dic.i_uid = cpu_to_le16((u16)inode->i_uid);
 		u.dic.i_gid = cpu_to_le16((u16)inode->i_gid);
-		u.dic.i_mtime = cpu_to_le64(inode->i_mtime - sbi->epoch);
+		u.dic.i_mtime = cpu_to_le32(inode->i_mtime - sbi->epoch);
 		u.dic.i_u = u1;
 
 		if (nlink_1) {
