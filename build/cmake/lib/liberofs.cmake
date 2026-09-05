@@ -100,7 +100,6 @@ set(liberofs_srcs
 	"${TARGET_SRC_DIR}/zmap.c"
 	"${TARGET_SRC_DIR}/decompress.c"
 	"${TARGET_SRC_DIR}/compress_hints.c"
-	"${TARGET_SRC_DIR}/hashmap.c"
 	"${TARGET_SRC_DIR}/sha256.c"
 	"${TARGET_SRC_DIR}/blobchunk.c"
 	"${TARGET_SRC_DIR}/dir.c"
