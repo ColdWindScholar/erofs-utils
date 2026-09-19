@@ -149,8 +149,7 @@ unsigned int erofs_iput(struct erofs_inode *inode)
 	list_for_each_entry_safe(d, t, &inode->i_subdirs, d_child)
 		free(d);
 
-	free(inode->compressmeta);
-	free(inode->eof_tailraw);
+	z_erofs_free_metadata(inode);
 	erofs_remove_ihash(inode);
 	if (!erofs_is_special_identifier(inode->i_srcpath))
 		free(inode->i_srcpath);
@@ -198,24 +197,34 @@ struct erofs_dentry *erofs_d_alloc(struct erofs_inode *parent,
 
 /* allocate main data for an inode */
 int erofs_allocate_inode_bh_data(struct erofs_inode *inode, erofs_blk_t nblocks,
-				 bool in_metazone)
+				 int device_id)
 {
 	struct erofs_sb_info *sbi = inode->sbi;
-	struct erofs_bufmgr *bmgr = in_metazone ?
-		erofs_metadata_bmgr(sbi, false) : sbi->bmgr;
+	struct erofs_bufmgr *bmgr;
 	struct erofs_buffer_head *bh;
 	int ret, type;
+
+	if (device_id < 0)
+		bmgr = erofs_metadata_bmgr(sbi, false);
+	else if (!device_id)
+		bmgr = sbi->bmgr;
+	else
+		bmgr = sbi->devs[device_id - 1].bmgr;
+
+	if (!bmgr) {
+		if (device_id < 0)
+			erofs_err("cannot allocate data in the unavailable metadata zone for %s",
+				  inode->i_srcpath);
+		else
+			erofs_err("cannot allocate data on unavailable device %d for %s",
+				  device_id, inode->i_srcpath);
+		return -EINVAL;
+	}
 
 	if (!nblocks) {
 		/* it has only tail-end data */
 		inode->u.i_blkaddr = EROFS_NULL_ADDR;
 		return 0;
-	}
-
-	if (in_metazone && !bmgr) {
-		erofs_err("cannot allocate data in the metazone when unavailable for %s",
-			  inode->i_srcpath);
-		return -EINVAL;
 	}
 
 	/* allocate main data buffer */
@@ -232,8 +241,10 @@ int erofs_allocate_inode_bh_data(struct erofs_inode *inode, erofs_blk_t nblocks,
 	DBG_BUGON(ret < 0);
 
 	/* write blocks except for the tail-end block */
-	inode->u.i_blkaddr = bh->block->blkaddr | (in_metazone ?
-		(sbi->extra_devices + 1ULL) << EROFS_I_BLKADDR_DEV_ID_BIT : 0);
+	if (device_id < 0)
+		device_id = sbi->extra_devices + 1;
+	inode->u.i_blkaddr = bh->block->blkaddr |
+		((u64)device_id << EROFS_I_BLKADDR_DEV_ID_BIT);
 	return 0;
 }
 
@@ -499,7 +510,7 @@ static int erofs_rebuild_inode_fix_pnid(struct erofs_inode *parent,
 
 		if (!fixed)
 			continue;
-		err = erofs_dev_write(dir.sbi, buf,
+		err = erofs_dev_write(dir.sbi, 0, buf,
 			(off + bsz > dir.i_size &&
 				dir.datalayout == EROFS_INODE_FLAT_INLINE ?
 				erofs_iloc(&dir) + isz : boff + off), count);
@@ -604,7 +615,7 @@ int erofs_write_file_from_buffer(struct erofs_inode *inode, char *buf)
 
 	inode->datalayout = EROFS_INODE_FLAT_INLINE;
 
-	ret = erofs_allocate_inode_bh_data(inode, nblocks, false);
+	ret = erofs_allocate_inode_bh_data(inode, nblocks, 0);
 	if (ret)
 		return ret;
 
@@ -635,7 +646,7 @@ static bool erofs_file_is_compressible(struct erofs_importer *im,
 
 static int erofs_write_unencoded_data(struct erofs_inode *inode,
 				      struct erofs_vfile *vf, erofs_off_t fpos,
-				      bool noseek, bool in_metazone)
+				      bool noseek, int device_id)
 {
 	struct erofs_sb_info *sbi = inode->sbi;
 	struct erofs_buffer_head *bh;
@@ -646,7 +657,7 @@ static int erofs_write_unencoded_data(struct erofs_inode *inode,
 
 	if (!noseek && erofs_sb_has_48bit(sbi)) {
 		if (erofs_io_lseek(vf, fpos, SEEK_DATA) == -ENXIO) {
-			ret = erofs_allocate_inode_bh_data(inode, 0, false);
+			ret = erofs_allocate_inode_bh_data(inode, 0, 0);
 			if (ret)
 				return ret;
 			inode->datalayout = EROFS_INODE_FLAT_PLAIN;
@@ -663,7 +674,7 @@ static int erofs_write_unencoded_data(struct erofs_inode *inode,
 	remaining = inode->i_size - inode->idata_size;
 
 	ret = erofs_allocate_inode_bh_data(inode, remaining >> sbi->blkszbits,
-					   in_metazone);
+					   device_id);
 	if (ret)
 		return ret;
 
@@ -704,30 +715,34 @@ static int erofs_write_unencoded_data(struct erofs_inode *inode,
 	return 0;
 }
 
-int erofs_write_unencoded_file(struct erofs_inode *inode, int fd, u64 fpos)
+static int erofs_write_unencoded_file(const struct erofs_importer *im,
+				      struct erofs_inode *inode, int fd, u64 fpos)
 {
 	struct erofs_vfile vf = { .fd = fd };
+	char chunkbits = im->params->chunkszbits_def;
+	int device_id = im->params->ddev_id_def;
 
-	if (cfg.c_chunkbits &&
+	if (chunkbits &&
 	    inode->datasource != EROFS_INODE_DATA_SOURCE_REBUILD_BLOB) {
-		inode->u.chunkbits = cfg.c_chunkbits;
+		inode->u.chunkbits = chunkbits;
 		/* chunk indexes when explicitly specified */
 		inode->u.chunkformat = 0;
 		if (cfg.c_force_chunkformat == FORCE_INODE_CHUNK_INDEXES)
 			inode->u.chunkformat = EROFS_CHUNK_FORMAT_INDEXES;
-		return erofs_blob_write_chunked_file(inode, fd, fpos);
+		return erofs_blob_write_chunked_file(inode, fd, fpos, device_id);
 	}
 
 	if (inode->datasource == EROFS_INODE_DATA_SOURCE_REBUILD_BLOB) {
 		if (erofs_io_lseek(&vf, fpos, SEEK_SET) != (off_t)fpos)
 			return -EIO;
-		return erofs_write_unencoded_data(inode, &vf, fpos, true, false);
+		return erofs_write_unencoded_data(inode, &vf, fpos, true, device_id);
 	}
 
 	inode->datalayout = EROFS_INODE_FLAT_INLINE;
 	/* fallback to all data uncompressed */
 	return erofs_write_unencoded_data(inode, &vf, fpos,
-			inode->datasource == EROFS_INODE_DATA_SOURCE_DISKBUF, false);
+			inode->datasource == EROFS_INODE_DATA_SOURCE_DISKBUF,
+			device_id);
 }
 
 static int erofs_write_dir_file(const struct erofs_importer *im,
@@ -746,7 +761,7 @@ static int erofs_write_dir_file(const struct erofs_importer *im,
 	} else {
 		DBG_BUGON(dir->idata_size != (dir->i_size & (bsz - 1)));
 		err = erofs_write_unencoded_data(dir, vf, 0, true,
-					im->params->dirdata_in_metazone);
+				im->params->dirdata_in_metazone ? -1 : 0);
 	}
 	erofs_io_close(vf);
 	return err;
@@ -909,9 +924,15 @@ int erofs_iflush(struct erofs_inode *inode)
 		if (inode->datalayout == EROFS_INODE_CHUNK_BASED) {
 			ret = erofs_write_chunk_indexes(inode, ibmgr->vf, off);
 		} else {	/* write compression metadata */
+			char *metabuf;
+
 			off = roundup(off, 8);
-			ret = erofs_io_pwrite(ibmgr->vf, inode->compressmeta,
+			metabuf = z_erofs_write_metadata(inode);
+			if (IS_ERR(metabuf))
+				return PTR_ERR(metabuf);
+			ret = erofs_io_pwrite(ibmgr->vf, metabuf,
 					      off, inode->extent_isize);
+			free(metabuf);
 		}
 		if (ret != inode->extent_isize)
 			return ret < 0 ? ret : -EIO;
@@ -977,6 +998,16 @@ static bool erofs_inode_need_48bit(struct erofs_inode *inode)
 	return false;
 }
 
+static unsigned int erofs_inode_meta_size(struct erofs_inode *inode)
+{
+	unsigned int inodesize;
+
+	inodesize = inode->inode_isize + inode->xattr_isize;
+	if (inode->extent_isize)
+		inodesize = roundup(inodesize, 8) + inode->extent_isize;
+	return inodesize;
+}
+
 static int erofs_prepare_inode_buffer(struct erofs_importer *im,
 				      struct erofs_inode *inode)
 {
@@ -996,9 +1027,7 @@ static int erofs_prepare_inode_buffer(struct erofs_importer *im,
 			inode->inode_isize =
 				sizeof(struct erofs_inode_extended);
 	}
-	inodesize = inode->inode_isize + inode->xattr_isize;
-	if (inode->extent_isize)
-		inodesize = roundup(inodesize, 8) + inode->extent_isize;
+	inodesize = erofs_inode_meta_size(inode);
 
 	if (!erofs_is_special_identifier(inode->i_srcpath) && sbi->mxgr)
 		inode->in_metabox = true;
@@ -1028,10 +1057,14 @@ static int erofs_prepare_inode_buffer(struct erofs_importer *im,
 	if (bh == ERR_PTR(-ENOSPC)) {
 		int ret;
 
-		if (is_inode_layout_compression(inode))
-			z_erofs_drop_inline_pcluster(inode);
-		else
+		if (is_inode_layout_compression(inode)) {
+			ret = z_erofs_drop_inline_pcluster(inode);
+			if (ret)
+				return ret;
+			inodesize = erofs_inode_meta_size(inode);
+		} else {
 			inode->datalayout = EROFS_INODE_FLAT_PLAIN;
+		}
 noinline:
 		/* expend an extra block for tail-end data */
 		ret = erofs_prepare_tail_block(inode);
@@ -1045,7 +1078,8 @@ noinline:
 		return PTR_ERR(bh);
 	} else if (inode->idata_size) {
 		if (is_inode_layout_compression(inode)) {
-			DBG_BUGON(!params->ztailpacking);
+			DBG_BUGON(!erofs_sb_has_ztailpacking(sbi) &&
+				  !params->ztailpacking);
 			erofs_dbg("Inline %scompressed data (%u bytes) to %s",
 				  inode->idata_type == EROFS_IDATA_TYPE_RAW ? "un": "",
 				  inode->idata_size, inode->i_srcpath);
@@ -1132,7 +1166,7 @@ static int erofs_write_tail_end(struct erofs_importer *im,
 				params->dirdata_in_metazone;
 
 			ret = erofs_allocate_inode_bh_data(inode, 1,
-							   in_metazone);
+					in_metazone ? -1 : params->ddev_id_def);
 			if (ret)
 				return ret;
 			bh = inode->bh_data;
@@ -1491,6 +1525,11 @@ static int erofs_inode_reserve_data_blocks(struct erofs_inode *inode)
 	return 0;
 }
 
+struct erofs_mkfs_btctx {
+	struct erofs_importer *im;
+	bool rebuild, incremental;
+};
+
 struct erofs_mkfs_job_ndir_ctx {
 	struct erofs_inode *inode;
 	void *ictx;
@@ -1498,7 +1537,8 @@ struct erofs_mkfs_job_ndir_ctx {
 	u64 fpos;
 };
 
-static int erofs_mkfs_job_write_file(struct erofs_mkfs_job_ndir_ctx *ctx)
+static int erofs_mkfs_job_write_file(const struct erofs_mkfs_btctx *btctx,
+				     struct erofs_mkfs_job_ndir_ctx *ctx)
 {
 	struct erofs_inode *inode = ctx->inode;
 	int ret;
@@ -1519,7 +1559,7 @@ static int erofs_mkfs_job_write_file(struct erofs_mkfs_job_ndir_ctx *ctx)
 		}
 	}
 	/* fallback to all data uncompressed */
-	ret = erofs_write_unencoded_file(inode, ctx->fd, ctx->fpos);
+	ret = erofs_write_unencoded_file(btctx->im, inode, ctx->fd, ctx->fpos);
 out:
 	if (inode->datasource == EROFS_INODE_DATA_SOURCE_DISKBUF) {
 		erofs_diskbuf_close(inode->i_diskbuf);
@@ -1538,11 +1578,6 @@ out:
 	}
 	return ret;
 }
-
-struct erofs_mkfs_btctx {
-	struct erofs_importer *im;
-	bool rebuild, incremental;
-};
 
 static int erofs_mkfs_handle_nondirectory(const struct erofs_mkfs_btctx *btctx,
 					  struct erofs_mkfs_job_ndir_ctx *ctx)
@@ -1575,7 +1610,7 @@ static int erofs_mkfs_handle_nondirectory(const struct erofs_mkfs_btctx *btctx,
 		if (inode->datasource == EROFS_INODE_DATA_SOURCE_RESVSP)
 			ret = erofs_inode_reserve_data_blocks(inode);
 		else if (ctx->fd >= 0)
-			ret = erofs_mkfs_job_write_file(ctx);
+			ret = erofs_mkfs_job_write_file(btctx, ctx);
 	}
 	if (ret)
 		return ret;
@@ -2412,7 +2447,7 @@ struct erofs_inode *erofs_mkfs_build_special_from_fd(struct erofs_importer *im,
 	ret = erofs_write_unencoded_data(inode,
 			&(struct erofs_vfile){ .fd = fd }, 0,
 			inode->datasource == EROFS_INODE_DATA_SOURCE_DISKBUF,
-			false);
+			0);
 	if (ret)
 		return ERR_PTR(ret);
 out:
@@ -2469,7 +2504,8 @@ int erofs_fixup_root_inode(struct erofs_inode *root)
 		return -ENOMEM;
 	err = erofs_dev_read(sbi, 0, ibuf, erofs_iloc(root), ondisk_size);
 	if (err >= 0)
-		err = erofs_dev_write(sbi, ibuf, erofs_iloc(&oi), ondisk_size);
+		err = erofs_dev_write(sbi, 0, ibuf, erofs_iloc(&oi),
+				      ondisk_size);
 	free(ibuf);
 	return err;
 }

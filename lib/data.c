@@ -8,7 +8,23 @@
 #include "erofs/internal.h"
 #include "erofs/trace.h"
 #include "erofs/decompress.h"
+#include "liberofs_cache.h"
 #include "liberofs_fragments.h"
+
+int erofs_dev_write(struct erofs_sb_info *sbi, int device_id,
+		    const void *buf, u64 offset, size_t len)
+{
+	ssize_t ret;
+
+	ret = erofs_io_pwrite(device_id ?
+				sbi->devs[device_id - 1].bmgr->vf : &sbi->bdev,
+			      buf, offset, len);
+	if (ret < 0)
+		return ret;
+	if (ret != (ssize_t)len)
+		return -EIO;
+	return 0;
+}
 
 void *erofs_bread(struct erofs_buf *buf, erofs_off_t offset, bool need_kmap)
 {
@@ -72,7 +88,7 @@ int __erofs_map_blocks(struct erofs_inode *inode,
 	struct erofs_sb_info *sbi = inode->sbi;
 	unsigned int unit, blksz = 1 << sbi->blkszbits;
 	struct erofs_inode_chunk_index *idx;
-	u8 buf[EROFS_MAX_BLOCK_SIZE];
+	struct erofs_buf buf = __EROFS_BUF_INITIALIZER;
 	erofs_blk_t startblk, addrmask, nblocks;
 	bool tailpacking;
 	erofs_off_t pos;
@@ -115,11 +131,10 @@ int __erofs_map_blocks(struct erofs_inode *inode,
 	pos = roundup(erofs_iloc(vi) + vi->inode_isize +
 		      vi->xattr_isize, unit) + unit * chunknr;
 
-	err = erofs_blk_read(sbi, 0, buf, erofs_blknr(sbi, pos), 1);
-	if (err < 0)
-		return -EIO;
-
-	idx = (void *)buf + erofs_blkoff(sbi, pos);
+	idx = erofs_read_metabuf(&buf, sbi, pos,
+				erofs_inode_in_metabox(vi));
+	if (IS_ERR(idx))
+		return PTR_ERR(idx);
 	map->m_la = chunknr << vi->u.chunkbits;
 	map->m_llen = min_t(erofs_off_t, 1ULL << vi->u.chunkbits,
 			    round_up(inode->i_size - map->m_la, blksz));
@@ -141,6 +156,7 @@ int __erofs_map_blocks(struct erofs_inode *inode,
 			map->m_flags = EROFS_MAP_MAPPED;
 		}
 	}
+	erofs_put_metabuf(&buf);
 out:
 	if (!err) {
 		map->m_plen = map->m_llen;

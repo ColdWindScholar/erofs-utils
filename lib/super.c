@@ -52,10 +52,11 @@ static int erofs_init_devices(struct erofs_sb_info *sbi,
 
 	sbi->extra_devices = ondisk_extradevs;
 	sbi->device_id_mask = roundup_pow_of_two(ondisk_extradevs + 1) - 1;
+	sbi->devt_slotoff = le16_to_cpu(dsb->devt_slotoff);
 	sbi->devs = calloc(ondisk_extradevs, sizeof(*sbi->devs));
 	if (!sbi->devs)
 		return -ENOMEM;
-	pos = le16_to_cpu(dsb->devt_slotoff) * EROFS_DEVT_SLOT_SIZE;
+	pos = sbi->devt_slotoff * EROFS_DEVT_SLOT_SIZE;
 	for (i = 0; i < ondisk_extradevs; ++i) {
 		struct erofs_deviceslot dis;
 		int ret;
@@ -269,7 +270,7 @@ int erofs_writesb(struct erofs_sb_info *sbi)
 	}
 	memcpy(buf + EROFS_SUPER_OFFSET, &sb, sbi->sb_size);
 
-	ret = erofs_dev_write(sbi, buf, sb_bh ? erofs_btell(sb_bh, false) : 0,
+	ret = erofs_dev_write(sbi, 0, buf, sb_bh ? erofs_btell(sb_bh, false) : 0,
 			      EROFS_SUPER_OFFSET + sbi->sb_size);
 	free(buf);
 	if (sb_bh)
@@ -351,7 +352,7 @@ int erofs_enable_sb_chksum(struct erofs_sb_info *sbi, u32 *crc)
 	/* set up checksum field to erofs_super_block */
 	sb->checksum = cpu_to_le32(*crc);
 
-	ret = erofs_dev_write(sbi, buf, EROFS_SUPER_OFFSET, len);
+	ret = erofs_dev_write(sbi, 0, buf, EROFS_SUPER_OFFSET, len);
 	if (ret) {
 		erofs_err("failed to write checksummed superblock: %s",
 			  erofs_strerror(ret));
@@ -414,49 +415,62 @@ int erofs_mkfs_init_devices(struct erofs_sb_info *sbi, unsigned int devices)
 	return 0;
 }
 
+int erofs_update_all_devices(struct erofs_sb_info *sbi)
+{
+	struct erofs_device_info *di;
+	erofs_blk_t last_uniaddr = sbi->dif0.blocks;
+
+	for (di = sbi->devs; di < sbi->devs + sbi->extra_devices; ++di) {
+		if (di->bmgr)
+			di->blocks = erofs_mapbh(di->bmgr, NULL);
+		di->uniaddr = last_uniaddr;
+		last_uniaddr += di->blocks;
+	}
+	sbi->total_blocks = last_uniaddr;
+	return 0;
+}
+
 int erofs_write_device_table(struct erofs_sb_info *sbi)
 {
-	erofs_blk_t nblocks = sbi->dif0.blocks;
 	struct erofs_buffer_head *bh = sbi->bh_devt;
+	struct erofs_device_info *di = sbi->devs;
 	erofs_off_t pos;
-	unsigned int i, ret;
+	unsigned int ret;
 
 	if (!sbi->extra_devices)
-		goto out;
+		return 0;
 	if (!bh) {
-		if (erofs_sb_has_device_table(sbi))
-			return 0;
-		return -EINVAL;
+		if (!erofs_sb_has_device_table(sbi))
+			return -EINVAL;
+		pos = sbi->devt_slotoff * EROFS_DEVT_SLOT_SIZE;
+	} else {
+		pos = erofs_btell(bh, false);
+		if (pos == EROFS_NULL_ADDR) {
+			DBG_BUGON(1);
+			return -EINVAL;
+		}
 	}
 
-	pos = erofs_btell(bh, false);
-	if (pos == EROFS_NULL_ADDR) {
-		DBG_BUGON(1);
-		return -EINVAL;
-	}
-
-	i = 0;
 	do {
 		struct erofs_deviceslot dis = {
-			.uniaddr_lo = cpu_to_le32(nblocks),
-			.blocks_lo = cpu_to_le32(sbi->devs[i].blocks),
-			.blocks_hi = cpu_to_le16(sbi->devs[i].blocks >> 32),
-			.uniaddr_hi = cpu_to_le16(nblocks >> 32),
+			.uniaddr_lo = cpu_to_le32(di->uniaddr),
+			.blocks_lo = cpu_to_le32(di->blocks),
+			.blocks_hi = cpu_to_le16(di->blocks >> 32),
+			.uniaddr_hi = cpu_to_le16(di->uniaddr >> 32),
 		};
 
-		memcpy(dis.tag, sbi->devs[i].tag, sizeof(dis.tag));
-		ret = erofs_dev_write(sbi, &dis, pos, sizeof(dis));
+		memcpy(dis.tag, di->tag, sizeof(dis.tag));
+		ret = erofs_dev_write(sbi, 0, &dis, pos, sizeof(dis));
 		if (ret)
 			return ret;
 		pos += sizeof(dis);
-		nblocks += sbi->devs[i].blocks;
-	} while (++i < sbi->extra_devices);
+	} while (++di < sbi->devs + sbi->extra_devices);
 
-	bh->op = &erofs_drop_directly_bhops;
-	erofs_bdrop(bh, false);
-	sbi->bh_devt = NULL;
-out:
-	sbi->total_blocks = nblocks;
+	if (bh) {
+		bh->op = &erofs_drop_directly_bhops;
+		erofs_bdrop(bh, false);
+		sbi->bh_devt = NULL;
+	}
 	return 0;
 }
 
@@ -512,5 +526,25 @@ int erofs_mkfs_load_fs(struct erofs_sb_info *sbi, unsigned int dsunit)
 		return -ENOMEM;
 	sbi->bmgr = bmgr;
 	bmgr->dsunit = dsunit;
+	return 0;
+}
+
+int erofs_flush_all_devices(struct erofs_sb_info *sbi)
+{
+	struct erofs_device_info *di;
+	int err;
+
+	err = erofs_io_ftruncate(&sbi->bdev,
+				 (erofs_off_t)sbi->dif0.blocks << sbi->blkszbits);
+	if (err)
+		return err;
+	for (di = sbi->devs; di < sbi->devs + sbi->extra_devices; ++di) {
+		if (!di->bmgr)
+			continue;
+		err = erofs_io_ftruncate(di->bmgr->vf,
+				(erofs_off_t)di->blocks << sbi->blkszbits);
+		if (err)
+			return err;
+	}
 	return 0;
 }

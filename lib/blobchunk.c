@@ -34,7 +34,6 @@ struct erofs_chunkitem erofs_holechunk = {
 struct erofs_chunkmgr {
 	struct list_head chunks[65536];
 	struct list_head unhashed_chunks;
-	int device_id;
 };
 
 #define EROFS_CHUNK_NR_BUCKETS	\
@@ -49,7 +48,7 @@ struct erofs_chunkitem *erofs_get_unhashed_chunk(struct erofs_sb_info *sbi,
 	int ret;
 
 	if (__erofs_unlikely(!chunkmgr)) {
-		ret = erofs_blob_init(sbi, 0, 0);
+		ret = erofs_blob_init(sbi, 0);
 		if (ret)
 			return ERR_PTR(ret);
 		chunkmgr = sbi->chunkmgr;
@@ -323,11 +322,9 @@ static bool erofs_blob_can_merge(struct erofs_sb_info *sbi,
 }
 
 int erofs_blob_write_chunked_file(struct erofs_inode *inode, int fd,
-				  erofs_off_t startoff)
+				  erofs_off_t startoff, int device_id)
 {
 	struct erofs_sb_info *sbi = inode->sbi;
-	struct erofs_chunkmgr *cmgr = sbi->chunkmgr;
-	int device_id = cmgr->device_id;
 	unsigned int chunkbits = inode->u.chunkbits;
 	unsigned int count, unit;
 	struct erofs_chunkitem *chunk, *lastch;
@@ -557,18 +554,6 @@ int tarerofs_write_chunkes(struct erofs_inode *inode, erofs_off_t data_offset)
 	return 0;
 }
 
-int erofs_mkfs_dump_blobs(struct erofs_sb_info *sbi)
-{
-	struct erofs_device_info *di;
-
-	for (di = sbi->devs; di < sbi->devs + sbi->extra_devices; ++di) {
-		if (!di->bmgr)
-			continue;
-		di->blocks = erofs_mapbh(di->bmgr, NULL);
-	}
-	return 0;
-}
-
 static int erofs_insert_zerochunk(struct erofs_chunkmgr *cmgr,
 				  unsigned int cbitsdef)
 {
@@ -636,8 +621,7 @@ err_vf:
 	return ret;
 }
 
-int erofs_blob_init(struct erofs_sb_info *sbi, int blobdev_id,
-		    unsigned int chunkbits_zero)
+int erofs_blob_init(struct erofs_sb_info *sbi, unsigned int chunkbits_zero)
 {
 	struct erofs_chunkmgr *cmgr;
 	int i, ret;
@@ -656,7 +640,6 @@ int erofs_blob_init(struct erofs_sb_info *sbi, int blobdev_id,
 			if (ret)
 				goto err_out;
 		}
-		cmgr->device_id = blobdev_id;
 		sbi->chunkmgr = cmgr;
 	}
 	return 0;

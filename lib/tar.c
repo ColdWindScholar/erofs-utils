@@ -691,7 +691,7 @@ static int tarerofs_write_uncompressed_file(struct erofs_inode *inode,
 	inode->datalayout = EROFS_INODE_FLAT_PLAIN;
 	nblocks = DIV_ROUND_UP(inode->i_size, 1U << sbi->blkszbits);
 
-	ret = erofs_allocate_inode_bh_data(inode, nblocks, false);
+	ret = erofs_allocate_inode_bh_data(inode, nblocks, 0);
 	if (ret)
 		return ret;
 
@@ -705,7 +705,7 @@ static int tarerofs_write_uncompressed_file(struct erofs_inode *inode,
 				ret = -EIO;
 			break;
 		}
-		if (erofs_dev_write(sbi, buf,
+		if (erofs_dev_write(sbi, 0, buf,
 				    erofs_pos(sbi, inode->u.i_blkaddr) + pos,
 				    ret)) {
 			ret = -EIO;
