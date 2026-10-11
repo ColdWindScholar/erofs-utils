@@ -54,17 +54,6 @@ unsigned char erofs_mode_to_ftype(umode_t mode)
 	return erofs_ftype_by_mode[(mode & S_IFMT) >> S_SHIFT];
 }
 
-static const unsigned char erofs_dtype_by_ftype[EROFS_FT_MAX] = {
-	[EROFS_FT_UNKNOWN]	= DT_UNKNOWN,
-	[EROFS_FT_REG_FILE]	= DT_REG,
-	[EROFS_FT_DIR]		= DT_DIR,
-	[EROFS_FT_CHRDEV]	= DT_CHR,
-	[EROFS_FT_BLKDEV]	= DT_BLK,
-	[EROFS_FT_FIFO]		= DT_FIFO,
-	[EROFS_FT_SOCK]		= DT_SOCK,
-	[EROFS_FT_SYMLINK]	= DT_LNK
-};
-
 static const umode_t erofs_dtype_by_umode[EROFS_FT_MAX] = {
 	[EROFS_FT_UNKNOWN]	= S_IFMT,
 	[EROFS_FT_REG_FILE]	= S_IFREG,
@@ -82,14 +71,6 @@ umode_t erofs_ftype_to_mode(unsigned int ftype, unsigned int perm)
 		ftype = EROFS_FT_UNKNOWN;
 
 	return erofs_dtype_by_umode[ftype] | perm;
-}
-
-unsigned char erofs_ftype_to_dtype(unsigned int filetype)
-{
-	if (filetype >= EROFS_FT_MAX)
-		return DT_UNKNOWN;
-
-	return erofs_dtype_by_ftype[filetype];
 }
 
 static struct list_head erofs_ihash[65536];
@@ -2090,14 +2071,16 @@ static int erofs_mkfs_begin_nondirectory(const struct erofs_mkfs_btctx *btctx,
 
 		ret = erofs_set_inode_fingerprint(inode, ctx.fd, ctx.fpos);
 		if (ret < 0)
-			return ret;
+			goto err_close;
 
 		if (inode->datasource != EROFS_INODE_DATA_SOURCE_REBUILD_BLOB &&
 		    inode->sbi->available_compr_algs &&
 		    erofs_file_is_compressible(im, inode)) {
 			ctx.ictx = erofs_prepare_compressed_file(im, inode);
-			if (IS_ERR(ctx.ictx))
-				return PTR_ERR(ctx.ictx);
+			if (IS_ERR(ctx.ictx)) {
+				ret = PTR_ERR(ctx.ictx);
+				goto err_close;
+			}
 			erofs_bind_compressed_file_with_fd(ctx.ictx,
 							   ctx.fd, ctx.fpos);
 			ret = erofs_begin_compressed_file(ctx.ictx);
@@ -2107,6 +2090,12 @@ static int erofs_mkfs_begin_nondirectory(const struct erofs_mkfs_btctx *btctx,
 	}
 out:
 	return erofs_mkfs_go(btctx, EROFS_MKFS_JOB_NDIR, &ctx, sizeof(ctx));
+
+err_close:
+	/* the diskbuf fd is shared and released along with the diskbuf */
+	if (inode->datasource != EROFS_INODE_DATA_SOURCE_DISKBUF)
+		close(ctx.fd);
+	return ret;
 }
 
 static int erofs_mkfs_handle_inode(const struct erofs_mkfs_btctx *ctx,
@@ -2165,13 +2154,13 @@ static int erofs_mkfs_handle_inode(const struct erofs_mkfs_btctx *ctx,
 
 static bool erofs_inode_visited(struct erofs_inode *inode)
 {
-	return (unsigned long)inode->i_parent & 1UL;
+	return (uintptr_t)inode->i_parent & 1;
 }
 
 static void erofs_mark_parent_inode(struct erofs_inode *inode,
 				    struct erofs_inode *dir)
 {
-	inode->i_parent = (void *)((unsigned long)dir | 1);
+	inode->i_parent = (void *)((uintptr_t)dir | 1);
 }
 
 static int erofs_mkfs_dump_tree(const struct erofs_mkfs_btctx *ctx)

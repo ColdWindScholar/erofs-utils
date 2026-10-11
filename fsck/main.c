@@ -569,9 +569,9 @@ static int erofs_verify_inode_data(struct erofs_inode *inode, int outfd,
 						(const u8 *)zeros, chunk);
 					remain -= chunk;
 				}
-			} else if (outfd >= 0) {
-				ret = lseek(outfd, map.m_llen, SEEK_CUR);
-				if (ret < 0) {
+			}
+			if (outfd >= 0) {
+				if (lseek(outfd, map.m_llen, SEEK_CUR) < 0) {
 					ret = -errno;
 					goto out;
 				}
@@ -855,6 +855,11 @@ again:
 	}
 
 	ret = erofsfsck_calc_inode_data(inode, fd);
+	if (!ret && ftruncate(fd, inode->i_size)) {
+		ret = -errno;
+		erofs_err("failed to set file size: %s (%s)",
+			  fsckcfg.extract_path, strerror(-ret));
+	}
 	close(fd);
 	return ret;
 }

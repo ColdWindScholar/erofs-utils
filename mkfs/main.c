@@ -1262,8 +1262,9 @@ static int mkfs_parse_options_cfg(struct erofs_importer_params *params,
 		}
 
 		case 11:
+			errno = 0;
 			i = strtol(optarg, &endptr, 0);
-			if (*endptr != '\0') {
+			if (errno || *endptr != '\0' || i <= 0 || i > INT_MAX) {
 				erofs_err("invalid chunksize %s", optarg);
 				return -EINVAL;
 			}
@@ -1885,6 +1886,7 @@ int main(int argc, char **argv)
 		}
 	}
 
+	importer_params.z_paramsets = mkfscfg.zcfgs;
 	err = erofs_load_compress_hints(&importer, &g_sbi);
 	if (err) {
 		erofs_err("failed to load compress hints %s",
@@ -1894,7 +1896,6 @@ int main(int argc, char **argv)
 
 	if (mkfscfg.inlinexattr_tolerance < 0)
 		importer_params.no_xattrs = true;
-	importer_params.z_paramsets = mkfscfg.zcfgs;
 	importer_params.source = cfg.c_src_path;
 	importer_params.no_datainline = mkfs_no_datainline;
 	importer_params.dot_omitted = mkfs_dot_omitted;
